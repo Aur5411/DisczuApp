@@ -1,0 +1,2546 @@
+package com.discuz.app
+
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Message
+import android.util.Log
+import android.view.Menu
+import android.view.MenuItem
+import android.view.View
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.ProgressBar
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
+import androidx.core.content.ContextCompat
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import java.io.ByteArrayInputStream
+
+/**
+ * Discuz! X3.5 论坛网页壳（Diszu论坛）。
+ *
+ * 冷启动打开**用户在设置里填写的**论坛网址；没有任何内置默认网址，未填写时强制先填。
+ * 用户在 WebView 内正常登录（Cookie 持久化），浏览帖子正文、点击附件下载。
+ *
+ * 下载能力（与站点版本无关，适配 Discuz 通用结构）：
+ *  - DownloadListener 主通道：附件链接让 WebView 原生导航，服务器返回文件时自动接管下载；
+ *  - onCreateWindow 弹窗接管：跳转页/新窗口(window.open/target=_blank) 的文件地址转发回主 WebView，
+ *    文件响应触发 DownloadListener；
+ *  - shouldInterceptRequest 拦截网：对附件/文件地址先自己探测一次，是文件直接保存（不依赖系统弹窗），
+ *    是网页则交回 WebView 原生渲染（页面内 meta refresh / JS 跳转才能生效）；
+ *  - 浏览器通道(DownloadBridge)：原生请求被返回网页拦截时，改用页面内 fetch()（网络栈与真实浏览器一致）
+ *    取文件，分块经 JS 桥回传保存。
+ *  - 文件名：去站点标记（如 [sxsy.org] 前缀），乱码修复，按魔数补扩展名，同名自动加序号。
+ *
+ * 版面列表「自动加载下一页」的返回还原：
+ *  - 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
+ *    （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
+ *  - 因此从「版面列表」点进**派生页面**时，一律改在新开的独立界面里打开
+ *    （同一 Activity，带 EXTRA_THREAD_MODE），列表界面只被覆盖、不被销毁，
+ *    返回时列表已追加的多页内容与滚动位置原封不动，且不引入任何还原脚本（不卡顿）。
+ *  - 派生页面 = 帖子页 + 帖子名旁的分类 tag（filter=typeid）+ 标签页（mod=tag）等；
+ *    版块自身翻页（&page=N）不算，仍在原界面内导航。
+ *  - 堆叠有上限：版面列表 → 列表型派生页（标签/分类/淘帖）→ 帖子，共 3 层。
+ *    从标签列表点进帖子时会再开一层，是为了让返回时**标签列表也不被销毁**（否则一样回到第一页）；
+ *    而帖子之间互跳、列表之间互跳仍在同界面内导航，不会无界堆叠。
+ *    返回键的「入口底线」按页面类型判定（isAtScreenEntry）：入口页自身重定向多出来的那一格
+ *    算入口，用户点开的帖子不算 —— 否则从分区列表点进帖子再返回会一步跨过列表落回上一层。
+ *
+ * 保留通用辅助：浏览历史、内置 TXT 阅读器入口(在下载管理里打开)、设置(网址/下载目录/历史保留/清数据)、诊断日志。
+ *
+ * 页面注入脚本（onPageFinished，文档完整解析后）：
+ *  - injectAdBlock()      弹窗广告屏蔽（popadv 插件 + Discuz fwin_ 广告浮层兜底）
+ *  - injectAttachNameJs() 读取帖子内附件真实文件名并上报，用于下载时保留原名
+ *  - injectForumCleanup() 摘掉外链推广分区 + 残留广告节点（规则见 AdBlocker.kt）
+ *  - injectAutoSign()     每日签到自动完成
+ *  - injectAttachPayHook() 付费附件自动购买/下载挂钩
+ *  - injectCustomJs()     设置页「自定义脚本（JS）」——最后注入，跑在内置脚本之后
+ * 广告资源另在 shouldInterceptRequest 层直接拦掉（popadv.js 换成空实现）。
+ */
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val REQ_STORAGE = 100
+        private const val REQ_SETUP = 101
+        /** 从「历史记录」页 / 帖子独立界面打开指定网址时，Intent 携带的 URL 键 */
+        const val EXTRA_OPEN_URL = "open_url"
+
+        /**
+         * 设置页里切换了「常用网址」开关 —— 主界面 `onResume` 要**无条件跳到新网址首页**，
+         * 即使当前停在帖子里（否则会被 `threadMode` / `returningFromThreadScreen` 的提前 return 拦掉，
+         * 表现为「切换了但没反应」）。用完即清。
+         */
+        @Volatile
+        var forceHomeReload = false
+        /**
+         * 本实例是否为承载「派生页面」的独立界面（帖子 / 分类 tag 筛选 / 标签页）。
+         * 从版面列表点进这些页面时新开一个界面承载，列表界面只被覆盖、不被销毁，
+         * 返回时列表已自动加载的多页内容与滚动位置原样还在。
+         */
+        const val EXTRA_THREAD_MODE = "thread_mode"
+        /**
+         * 本实例在「独立界面堆叠」里的层数：
+         * 0 = 主界面（版面列表）、1 = 列表型派生页（标签 / 分类筛选 / 淘帖）、2 = 帖子。
+         * 用来给堆叠加一个硬上限，避免「标签 → 帖子 → 标签 → 帖子」无限开新界面。
+         */
+        const val EXTRA_SCREEN_DEPTH = "screen_depth"
+        /** 独立界面堆叠上限（最多 3 层：版面列表 → 列表型派生页 → 帖子） */
+        private const val MAX_SCREEN_DEPTH = 2
+    }
+
+    /** 适配高刷新率屏幕：在同分辨率模式中选刷新率最高的（API 23+） */
+    @SuppressLint("InlinedApi")
+    private fun applyHighRefreshRate() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        try {
+            val display = windowManager.defaultDisplay
+            val modes = display.supportedModes
+            if (modes.isNullOrEmpty()) return
+            val currentMode = display.mode
+            val bestMode = modes
+                .filter { it.physicalWidth == currentMode.physicalWidth && it.physicalHeight == currentMode.physicalHeight }
+                .maxByOrNull { it.refreshRate } ?: return
+            if (bestMode.refreshRate > currentMode.refreshRate) {
+                window.attributes = window.attributes.apply {
+                    preferredDisplayModeId = bestMode.modeId
+                }
+            }
+        } catch (e: Exception) { /* 忽略 */ }
+    }
+
+    private lateinit var webView: WebView
+    private lateinit var swipeRefresh: SwipeRefreshLayout
+    private lateinit var progressBar: ProgressBar
+    private lateinit var toolbar: Toolbar
+    private var lastLoadedUrl: String? = null
+    private var lastDesktopMode: Boolean? = null
+    // 从「历史记录」页打开链接后，本次 onResume 不得用配置的首页覆盖掉它
+    private var openedFromHistory = false
+    // 首次启动：尚未配置论坛网址，正等待从设置页返回（期间 onResume 不自动加载）
+    private var awaitingSetup = false
+    // 是否已弹过首页加载失败提示，避免多次打断
+    private var homeErrorShown = false
+    // 登录回跳死循环(ERR_TOO_MANY_REDIRECTS)的自动恢复标记：单次导航只自动恢复一次，避免自身再循环
+    private var redirectLoopRetried = false
+
+    // 版面列表「自动加载下一页」的返回还原（1.3.19 起改为结构化方案）：
+    // 站点是把后续页用 JS 追加进当前 DOM，而 Android WebView 的 goBack 一定会重建文档
+    // （WebView 不支持 BFCache），追加内容必然丢失，只剩第一页；
+    // 之前试过「记录高度再滚回去触发站点自动加载」和「body 快照还原」，前者依赖站点机制、
+    // 加载不全还卡顿，后者会让页面 JS（翻页/formhash/事件）全部失效。
+    // 现在改为：从「版面列表」点进「派生页面」（帖子 / 分类 tag / 标签页）时，
+    // 一律在新的独立界面里打开，列表界面只被覆盖、不被销毁 —— 返回时 DOM
+    // （含已追加的多页）与滚动位置原封不动。（1.3.20 起覆盖到分类 tag 与标签页）
+    /** 本实例是否为承载「派生页面」的独立界面（历史命名 threadMode） */
+    private var threadMode = false
+    /** 本实例在独立界面堆叠里的层数（0 主界面 / 1 列表型派生页 / 2 帖子） */
+    private var screenDepth = 0
+    /** 本实例的入口地址（Intent 带入），供返回键判断「是否已退到本界面底线」使用 */
+    private var entryUrl: String? = null
+    /** 刚从这个界面点开帖子（新开了独立界面）：本次 onResume 不重载首页，保住版面列表 */
+    private var returningFromThreadScreen = false
+
+    // WebView 只能在主线程访问，而 shouldInterceptRequest 在后台线程运行：
+    // 预先在主线程缓存 UA 与最近的内容页地址（作下载 Referer），供后台拦截线程读取
+    @Volatile private var cachedUserAgent: String = ""
+    @Volatile private var lastContentPageUrl: String? = null
+    // 购买成功后待下载的附件 aid：刷新帖子页后据此找已生效的下载链接
+    @Volatile private var pendingDownloadAid: String? = null
+    private val popupWindows = mutableListOf<WebView>()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        threadMode = intent?.getBooleanExtra(EXTRA_THREAD_MODE, false) ?: false
+        screenDepth = intent?.getIntExtra(EXTRA_SCREEN_DEPTH, 0) ?: 0
+        applyHighRefreshRate()
+        Prefs.setDesktopMode(this, true)
+        Prefs.setAdBlock(this, true)
+        DebugLog.setEnabled(Prefs.isDebugMenuVisible(this))
+        setContentView(R.layout.activity_main)
+
+        toolbar = findViewById(R.id.toolbar)
+        setSupportActionBar(toolbar)
+        // 帖子独立界面：标题栏给一个返回箭头，点它等价于系统返回键（回到版面列表）
+        if (threadMode) {
+            supportActionBar?.setDisplayHomeAsUpEnabled(true)
+            supportActionBar?.setDisplayShowHomeEnabled(true)
+        }
+
+        webView = findViewById(R.id.webView)
+        swipeRefresh = findViewById(R.id.swipeRefresh)
+        progressBar = findViewById(R.id.progressBar)
+
+        setupWebView()
+        // 帖子界面不预热：此时已经有一个 WebView 在跑，避免多创建一次内核
+        if (!threadMode) warmUpWebView()
+
+        // 从「历史记录」页带 URL 启动：直接打开该网址
+        val openUrl = intent?.getStringExtra(EXTRA_OPEN_URL)
+        entryUrl = openUrl
+        if (!openUrl.isNullOrBlank()) {
+            handleOpenUrl(openUrl)
+        } else if (savedInstanceState == null) {
+            if (Prefs.getUrl(this).isBlank()) {
+                // 首次启动、尚未配置网址：先进入设置页填写，保存返回后加载
+                awaitingSetup = true
+                startActivityForResult(Intent(this, SettingsActivity::class.java), REQ_SETUP)
+            } else {
+                loadHome()
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        val openUrl = intent?.getStringExtra(EXTRA_OPEN_URL)
+        if (!openUrl.isNullOrBlank()) handleOpenUrl(openUrl)
+    }
+
+    /** 从历史记录打开指定网址：禁止 onResume 用首页覆盖 */
+    private fun handleOpenUrl(url: String) {
+        openedFromHistory = true
+        loadUrl(url)
+    }
+
+override fun onResume() {
+        super.onResume()
+        // 恢复本 WebView 的 JS 定时器与渲染（与 onPause 配对）。
+        // 必须在所有提前 return 之前调用：否则从帖子界面返回版面列表时，
+        // 因 returningFromThreadScreen 提前 return，本 WebView 会一直停留在暂停态而卡死。
+        try { webView.onResume() } catch (_: Exception) {}
+        // 等待首次设置期间：不自动加载，等 onActivityResult 清除标记后由本方法加载
+        if (awaitingSetup) return
+        // 设置页里**切换了网址开关** → 无条件跳到新网址首页（哪怕当前在帖子里）。
+        // 这个标记由 SettingsActivity 切换开关时置位，用完即清。
+        if (forceHomeReload) {
+            forceHomeReload = false
+            openedFromHistory = false
+            threadMode = false
+            returningFromThreadScreen = false
+            lastLoadedUrl = null
+            val u = Prefs.getUrl(this)
+            if (u.isNotBlank()) {
+                DebugLog.log("PAGE", "已切换网址，立即跳转: $u")
+                loadUrl(u)
+                return
+            }
+        }
+        // 从设置页返回后：网址 / 电脑版开关可能已改变，按需重新加载
+        val url = Prefs.getUrl(this)
+        val desktop = Prefs.isDesktopMode(this)
+        val uaChanged = lastDesktopMode != null && lastDesktopMode != desktop
+        lastDesktopMode = desktop
+        webView.settings.userAgentString = buildUserAgent()
+        cachedUserAgent = webView.settings.userAgentString
+        // 从历史记录打开、本实例是帖子独立界面、或刚点开帖子又返回本界面：
+        // 都不要用「配置的首页」把当前页覆盖掉，否则版面列表会被清掉
+        if (openedFromHistory || threadMode || returningFromThreadScreen) {
+            openedFromHistory = false
+            returningFromThreadScreen = false
+            return
+        }
+        val target = url
+        if (target.isBlank()) {
+            // 没有任何内置默认地址：必须由用户手动填写网址才能进入。
+            // 带 setup 标记打开设置页，未填写前不允许返回（SettingsActivity 里拦返回键）。
+            if (!awaitingSetup) {
+                awaitingSetup = true
+                Toast.makeText(this, "请先在设置里填写论坛网址", Toast.LENGTH_LONG).show()
+                startActivityForResult(
+                    Intent(this, SettingsActivity::class.java)
+                        .putExtra(SettingsActivity.EXTRA_SETUP, true),
+                    REQ_SETUP
+                )
+            }
+            return
+        }
+        if (uaChanged || target != lastLoadedUrl) {
+            loadUrl(target)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SETUP) {
+            if (Prefs.getUrl(this).isBlank()) {
+                // 首次启动且用户未保存网址：强制再次进入设置页，直到填写/确认网址为止
+                awaitingSetup = true
+                startActivityForResult(
+                    Intent(this, SettingsActivity::class.java)
+                        .putExtra(SettingsActivity.EXTRA_SETUP, true),
+                    REQ_SETUP
+                )
+            } else {
+                awaitingSetup = false
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // 清掉本界面的 WebView 定时器，避免被销毁后仍残留执行
+        try { webView.stopLoading() } catch (_: Exception) {}
+        popupWindows.forEach { try { it.destroy() } catch (_: Exception) {} }
+        popupWindows.clear()
+    }
+
+    override fun onPause() {
+        // 暂停本 WebView 的 JS 定时器与渲染：点开帖子会新开一个界面承载帖子页，
+        // 本界面（版面列表）转入后台。若不暂停，它注入的广告监听/自动购买轮询/自动签到
+        // 会继续在后台跑，与新界面的 WebView 抢主线程和 CPU —— 这是「打开帖子慢」的主因之一。
+        // 注意：这里只用实例方法 onPause()，不能用进程级的 WebView.pauseTimers()——
+        // 后者会把刚新开的帖子页 WebView 的定时器一起冻结。
+        try { webView.onPause() } catch (_: Exception) {}
+        super.onPause()
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    private fun setupWebView() {
+        val settings = webView.settings
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        // 记住每个网址各自的登录状态：Cookie 本身按域隔离保存，这里只保证
+        // 第三方 Cookie（跨域登录/统计域）不被默认禁掉，并在切换网址时 flush 落盘。
+        try {
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        } catch (e: Exception) {}
+        settings.databaseEnabled = true
+        settings.loadsImagesAutomatically = true
+        settings.mediaPlaybackRequiresUserGesture = false
+        // 多窗口 + onCreateWindow 接管：跳转页下载链接常用 window.open / target=_blank，
+        // 接管后转发回主 WebView 加载，服务器返回文件即触发 DownloadListener 自动下载
+        settings.setSupportMultipleWindows(true)
+        @Suppress("DEPRECATION")
+        settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.builtInZoomControls = true
+        settings.displayZoomControls = false
+        settings.setSupportZoom(true)
+        settings.cacheMode = WebSettings.LOAD_DEFAULT
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.userAgentString = buildUserAgent()
+        cachedUserAgent = settings.userAgentString
+        try {
+            settings.setGeolocationEnabled(false)
+        } catch (e: Exception) { /* 忽略 */ }
+        // 安全加固：关闭本地文件访问，防止网页读取本地文件
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+        @Suppress("DEPRECATION")
+        settings.allowFileAccessFromFileURLs = false
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = false
+
+        // JS 桥接：浏览器通道下载（页面内 fetch）分块回传使用
+        webView.addJavascriptInterface(DownloadBridge(), "DiscuzApp")
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                progressBar.visibility = View.VISIBLE
+                if (url != null && !isDownloadCandidate(url)) lastContentPageUrl = url
+                DebugLog.log("PAGE", "加载开始: $url")
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                progressBar.visibility = View.GONE
+                swipeRefresh.isRefreshing = false
+                redirectLoopRetried = false
+                if (DebugLog.isEnabled()) injectClickLogger()
+                injectAdBlock()
+                if (DOM_NAME_RENAMING) injectAttachNameJs()   // 屏蔽重命名时不采集附件显示名
+                injectForumCleanup()
+                injectAutoSign()
+                injectAttachPayHook()
+                tryAutoPay()
+                injectCustomJs()   // 用户自定义脚本最后注入（在内置脚本之后）
+                updateTitle()
+                recordHistory(view, url)
+                // 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并下载。
+                // 排在附件名上报之后（injectAttachNameJs 会回调 attachNamesReady 提前触发）；
+                // 这里只是兜底排一次，避免 JS 桥没回调时卡住不下载。
+                webView.postDelayed({ tryAutoDownloadAfterBuy() }, 800)
+                DebugLog.log("PAGE", "加载完成: $url | title=${view?.title}")
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                DebugLog.log("NAV", url)
+                // 已屏蔽的版块（综合区三个外链版块）：不进、不弹站外
+                if (interceptHiddenForum(url)) return true
+                // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
+                if (openDerivedPageInNewScreen(url)) return true
+                // 畸形登录 URL 自愈：拦下死循环地址，改载干净登录页
+                selfHealLoginUrl(url)?.let { healed ->
+                    webView.loadUrl(healed)
+                    return true
+                }
+                if (interceptExternalNav(url)) return true
+                // 付费附件：主动接管购买+下载（站点 showWindow 弹窗失效）
+                if (isAttachPayUrl(url)) {
+                    handleAttachPay(url)
+                    return true
+                }
+                // 附件：每次点击直接接管下载，去掉“第一次放行、第二次才下载”
+                if (isDirectAttachmentUrl(url)) {
+                    startDirectAttachment(url)
+                    return true
+                }
+                return handleUrl(url)
+            }
+
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                if (url != null) {
+                    DebugLog.log("NAV", url)
+                    // 已屏蔽的版块（综合区三个外链版块）：不进、不弹站外
+                    if (interceptHiddenForum(url)) return true
+                    // 版面列表 → 帖子/分类标签/标签页：新开独立界面承载，让列表留在后台（返回即原样恢复）
+                    if (openDerivedPageInNewScreen(url)) return true
+                    selfHealLoginUrl(url)?.let { healed ->
+                        webView.loadUrl(healed)
+                        return true
+                    }
+                    if (interceptExternalNav(url)) return true
+                    if (isAttachPayUrl(url)) {
+                        handleAttachPay(url)
+                        return true
+                    }
+                    if (isDirectAttachmentUrl(url)) {
+                        startDirectAttachment(url)
+                        return true
+                    }
+                }
+                return url?.let { handleUrl(it) } ?: false
+            }
+
+            override fun onReceivedError(
+                view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?
+            ) {
+                val req = request
+                val code = error?.errorCode ?: -1
+                val desc = error?.description?.toString() ?: ""
+                DebugLog.log("ERROR", "$code $desc @ ${req?.url} main=${req?.isForMainFrame}")
+                val errUrl = req?.url?.toString()
+
+                // 登录回跳死循环(ERR_TOO_MANY_REDIRECTS，WebView 内部 302 环)：自动恢复一次，
+                // 把畸形 index.php/ 前缀归正后用干净地址重新加载，打断死循环
+                if (req != null && req.isForMainFrame &&
+                    code == android.webkit.WebViewClient.ERROR_REDIRECT_LOOP &&
+                    !redirectLoopRetried && errUrl != null
+                ) {
+                    redirectLoopRetried = true
+                    val healed = selfHealLoginUrl(errUrl) ?: Prefs.getHomeUrl(this@MainActivity)
+                    DebugLog.log("NAV", "重定向死循环自动恢复 -> $healed")
+                    runOnUiThread { webView.loadUrl(healed) }
+                    return
+                }
+
+                // 仅主 frame 的网络级失败才提示（子资源/图片失败不打扰）；重定向死循环恢复过一次仍失败也提示
+                if (req != null && req.isForMainFrame && !homeErrorShown &&
+                    (isEntryNetworkError(code) || code == android.webkit.WebViewClient.ERROR_REDIRECT_LOOP)
+                ) {
+                    homeErrorShown = true
+                    runOnUiThread {
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle("暂时无法访问")
+                            .setMessage("网站暂时打不开，请检查网络后点击「刷新」重试，或稍后再试。")
+                            .setCancelable(false)
+                            .setPositiveButton("知道了") { _, _ -> homeErrorShown = false }
+                            .show()
+                    }
+                }
+            }
+
+            // Discuz 站点常有过期/不匹配证书，放行让其正常加载
+            override fun onReceivedSslError(
+                view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?
+            ) {
+                // 安全加固：论坛主站域名证书应有效，出现错误必是中间人攻击 → 拒绝；
+                // 非主站域名（中转/资源等）证书过期则放行，保持正常功能
+                val errUrl = error?.url ?: ""
+                val host = try { Uri.parse(errUrl).host?.lowercase() } catch (e: Exception) { null }
+                val isMainHost = host != null && trustedHosts().any { h ->
+                    host == h || host.endsWith(".$h")
+                }
+                if (isMainHost) {
+                    DebugLog.log("SSL", "拒绝主站证书错误: $errUrl")
+                    handler?.cancel()
+                } else {
+                    DebugLog.log("SSL", "放行非主站证书错误: $errUrl")
+                    handler?.proceed()
+                }
+            }
+
+            /**
+             * 拦截网：附件/文件地址的 GET 请求（含子框架/iframe/XHR）自己发一次请求：
+             * - 服务器返回文件 → 直接保存，返回一个结果页给 WebView
+             * - 服务器返回网页（跳转页/提示页）→ 原样交回 WebView 渲染，页面 JS 照常执行
+             * 注意：本方法运行在后台线程，严禁访问 webView —— UA 与 Referer 用主线程缓存的字段
+             */
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val req = request ?: return null
+                val url = req.url?.toString() ?: return null
+                if (req.method != "GET") return null
+                // 广告资源（popadv 插件、广告联盟脚本/图片）一律不加载。
+                // 只拦子资源：主框架放行交给下面的导航逻辑处理，避免把页面拦成白屏。
+                if (!req.isForMainFrame && AdBlocker.isAdUrl(url)) {
+                    DebugLog.log("AD", "拦截广告资源: $url")
+                    return AdBlocker.blockedResponse(url)
+                }
+                if (!isDownloadCandidate(url)) return null
+                // 主框架附件页必须完全交给 WebView 原生导航，真正返回文件时由 DownloadListener 接管
+                if (req.isForMainFrame) {
+                    DebugLog.log("INTERCEPT", "主框架附件放行原生导航: $url")
+                    return null
+                }
+                // 图片子资源放行：Discuz 正文里的附件图就是拿 `forum.php?mod=attachment&aid=…`
+                // 当 <img src>/zoomfile 用的（见 discuzcode.php 的 attachinpost/imagelist），
+                // 这类请求若被当成下载吞掉，图片永远渲染不出来（只会白存一个文件 + 一张结果页），
+                // 表现就是「楼主发的图看不到」。判据用 <img> 必带的 Accept: image/* 头，精确且不误伤下载。
+                if (isImageSubresource(request)) {
+                    DebugLog.log("INTERCEPT", "图片子资源放行: $url")
+                    return null
+                }
+                if (allowNativeOnce(url)) {
+                    DebugLog.log("INTERCEPT", "放行原生请求一次: $url")
+                    return null
+                }
+                val ua = cachedUserAgent
+                if (ua.isBlank()) return null
+                val referer = lastContentPageUrl
+                // 拦截器已经存过的 URL：直接吞掉，不再让 WebView 二次下载
+                // （否则同一个附件会存成 xxx(5).txt 和 xxx(6).txt 两份，白占一倍空间）
+                // 返回**空的 204 响应**而不是结果页：这样页面不会闪一下，用户也看不到任何弹窗
+                if (isHandled(url)) {
+                    DebugLog.log("INTERCEPT", "该 URL 已由拦截器处理，静默吞掉重复请求: $url")
+                    return WebResourceResponse(
+                        "text/plain", "utf-8",
+                        204, "No Content", emptyMap(),
+                        ByteArrayInputStream(ByteArray(0))
+                    )
+                }
+                return try {
+                    val p = DownloadHelper.probe(this@MainActivity, ua, url, referer)
+                    if (!p.isFile) {
+                        p.file.delete()
+                        clearHandled(url)
+                        bypassProbeUrls[url] = System.currentTimeMillis()
+                        DebugLog.log("INTERCEPT", "网页，放行 WebView 原生加载: $url")
+                        null
+                    } else if (!markHandled(url)) {
+                        p.file.delete()
+                        DebugLog.log("INTERCEPT", "重复请求，跳过: $url")
+                        null
+                    } else {
+                        val hint = preferredNameFor(p.finalUrl)
+                        val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
+                        val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
+                        p.file.delete()
+                        noteSaved(url, savedName)
+                        DebugLog.log("INTERCEPT", "已保存: $savedName (${p.size}B)")
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "下载完成：$savedName\n保存于 Download/${Prefs.getDownloadDir(this@MainActivity)}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                        htmlResponse(downloadDonePage(savedName, p.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()))
+                    }
+                } catch (e: Exception) {
+                    DebugLog.log("INTERCEPT", "失败: ${e.message}")
+                    clearHandled(url)
+                    null
+                }
+            }
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                progressBar.progress = newProgress
+            }
+
+            // 诊断：页面 JS 报错/警告也记入日志
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                if (!DebugLog.isEnabled()) return false
+                consoleMessage?.let {
+                    DebugLog.log("JS", "${it.messageLevel()}: ${it.message()} @${it.sourceId()}:${it.lineNumber()}")
+                }
+                return true
+            }
+
+            // 接管新窗口请求（window.open / target=_blank）：临时 WebView 捕获地址，转发回主 WebView
+            override fun onCreateWindow(
+                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
+            ): Boolean {
+                DebugLog.log("POPUP", "新窗口请求 (gesture=$isUserGesture)")
+                // 非用户手势自动弹出的新窗口：广告/劫持的标准特征（浏览器默认也是拦的）。
+                // 用户真正点击的 target=_blank 链接会带 gesture=true，不受影响。
+                if (!isUserGesture) {
+                    DebugLog.log("POPUP", "拦截自动弹窗（非用户手势）")
+                    return true
+                }
+                val popup = WebView(this@MainActivity)
+                popup.settings.javaScriptEnabled = true
+                popup.settings.domStorageEnabled = true
+                popup.settings.databaseEnabled = true
+                popup.settings.javaScriptCanOpenWindowsAutomatically = true
+                popup.settings.setSupportMultipleWindows(true)
+                popup.settings.userAgentString = cachedUserAgent
+                popup.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
+                        DebugLog.log("POPUP", "加载开始: $url")
+                        if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                            runOnUiThread {
+                                if (isDirectAttachmentUrl(url)) {
+                                    v?.stopLoading()
+                                    startDirectAttachment(url)
+                                } else {
+                                    forwardPopupUrl(url)
+                                }
+                            }
+                        }
+                    }
+                    override fun onPageFinished(v: WebView?, url: String?) {
+                        DebugLog.log("POPUP", "加载完成: $url")
+                    }
+                    override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
+                        val u = req?.url?.toString() ?: return false
+                        if (u.startsWith("http://") || u.startsWith("https://")) {
+                            runOnUiThread { forwardPopupUrl(u) }
+                            return true
+                        }
+                        return true
+                    }
+                    @Suppress("DEPRECATION")
+                    override fun shouldOverrideUrlLoading(v: WebView?, url: String?): Boolean {
+                        val u = url ?: return false
+                        if (u.startsWith("http://") || u.startsWith("https://")) {
+                            runOnUiThread { forwardPopupUrl(u) }
+                            return true
+                        }
+                        return true
+                    }
+                }
+                popup.setDownloadListener { url, _, cd, mime, _ ->
+                    DebugLog.log("DOWNLOAD", "Popup 下载监听: $url | mime=$mime | cd=$cd")
+                    onDownloadStart(url, cd, mime)
+                }
+                popup.webChromeClient = object : WebChromeClient() {
+                    override fun onCreateWindow(
+                        child: WebView?, dialog: Boolean, gesture: Boolean, msg: Message?
+                    ): Boolean {
+                        DebugLog.log("POPUP", "弹出页再次请求新窗口 (gesture=$gesture)")
+                        val nested = WebView(this@MainActivity)
+                        nested.settings.javaScriptEnabled = true
+                        nested.settings.domStorageEnabled = true
+                        nested.settings.javaScriptCanOpenWindowsAutomatically = true
+                        nested.settings.userAgentString = cachedUserAgent
+                        nested.webViewClient = object : WebViewClient() {}
+                        nested.setDownloadListener { u, _, cd, mime, _ ->
+                            DebugLog.log("DOWNLOAD", "嵌套弹出页下载监听: $u | mime=$mime | cd=$cd")
+                            onDownloadStart(u, cd, mime)
+                        }
+                        popupWindows.add(nested)
+                        val transport = msg?.obj as? WebView.WebViewTransport ?: return false
+                        transport.webView = nested
+                        msg.sendToTarget()
+                        return true
+                    }
+                }
+                popupWindows.add(popup)
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                transport.webView = popup
+                resultMsg.sendToTarget()
+                return true
+            }
+        }
+
+        swipeRefresh.setOnRefreshListener { webView.reload() }
+
+        // 主下载通道：附件点击走浏览器导航，服务器返回文件时系统回调此处 → 自动下载
+        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            DebugLog.log("DOWNLOAD", "触发下载监听: $url | mime=$mimeType | cd=$contentDisposition")
+            onDownloadStart(url, contentDisposition, mimeType)
+        }
+    }
+
+    /** 可能是下载目标的地址：Discuz 附件端点，或常见的文件扩展名 */
+    private fun isDownloadCandidate(url: String): Boolean {
+        val l = url.lowercase()
+        // 只认真正的附件下载端点。注意：`attachpay` 是「付费购买确认」浮层，不能拦截
+        if (l.contains("attachpay")) return false
+        if (l.contains("mod=attachment") || l.contains("attachment.php")) return true
+        val path = l.substringBefore('?')
+        return path.endsWith(".txt") || path.endsWith(".zip") || path.endsWith(".rar") ||
+            path.endsWith(".7z") || path.endsWith(".pdf") || path.endsWith(".epub")
+    }
+
+    /**
+     * 是否由 `<img>` 发出的子资源请求。
+     *
+     * `<img>` 的 Accept 头固定含 `image/`（Chrome/WebView 会发
+     * `image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8`），
+     * 而页面内 fetch() 下载（下载通道）与主框架导航都不会带它。
+     * 用它把「要渲染的图片」和「要落盘的附件」区分开，避免下载拦截网把帖子里的图吞掉。
+     */
+    private fun isImageSubresource(request: WebResourceRequest?): Boolean {
+        if (request == null || request.isForMainFrame) return false
+        val headers = request.requestHeaders ?: return false
+        for ((k, v) in headers) {
+            if (k.equals("Accept", ignoreCase = true)) {
+                return v.contains("image/", ignoreCase = true)
+            }
+        }
+        return false
+    }
+
+    /**
+     * 同一地址在 [HANDLED_WINDOW_MS] 内只处理一次，避免**拦截通道与 DownloadListener 重复下载**
+     * （实测会存出 `xxx(5).txt` 与 `xxx(6).txt` 两份）。
+     *
+     * 键用**去掉查询串的路径**：Discuz 附件直链常带随机查询参数，
+     * 两次请求的完整 URL 可能不完全一样，只比完整串会漏判。
+     */
+    private val handledUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val HANDLED_WINDOW_MS = 30000L
+
+    /** HTML 探测后放行一次原生导航，防止 shouldInterceptRequest 与 WebView 互相循环 */
+    private val bypassProbeUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** 去重键：优先用 path（忽略 ?query#frag），拿不到就用原串 */
+    private fun urlKey(url: String): String = try {
+        val u = android.net.Uri.parse(url)
+        (if (u.scheme != null) u.scheme + "://" + u.host.orEmpty() else "") + (u.path ?: url)
+    } catch (e: Exception) { url }
+
+    /** 只判断是否已处理过，**不打标记**（给「吞掉重复请求」用） */
+    private fun isHandled(url: String): Boolean {
+        val prev = handledUrls[urlKey(url)] ?: return false
+        return System.currentTimeMillis() - prev < HANDLED_WINDOW_MS
+    }
+
+    /** 首次返回 true 并打标记；窗口内重复返回 false */
+    private fun markHandled(url: String): Boolean {
+        val key = urlKey(url)
+        val now = System.currentTimeMillis()
+        val it = handledUrls.entries.iterator()
+        while (it.hasNext()) {
+            if (now - it.next().value > HANDLED_WINDOW_MS) it.remove()
+        }
+        val prev = handledUrls[key]
+        if (prev != null && now - prev < HANDLED_WINDOW_MS) return false
+        handledUrls[key] = now
+        return true
+    }
+
+    /** 撤销标记：这次探测判定为网页、要放行给 WebView 时调用，避免把正常导航误判成重复 */
+    private fun clearHandled(url: String) {
+        handledUrls.remove(urlKey(url))
+    }
+
+    /** 已保存的文件名（按去重键），用于「跳过重复下载」时告诉用户省下的是哪个文件 */
+    private val savedNameByUrl = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun noteSaved(url: String, name: String) {
+        savedNameByUrl[urlKey(url)] = name
+    }
+
+    private fun savedNameOf(url: String): String? = savedNameByUrl[urlKey(url)]
+
+    private fun allowNativeOnce(url: String): Boolean {
+        val now = System.currentTimeMillis()
+        bypassProbeUrls.entries.removeIf { now - it.value > 10000 }
+        return bypassProbeUrls.remove(url) != null
+    }
+
+    private fun htmlResponse(html: String): WebResourceResponse =
+        WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(html.toByteArray()))
+
+    /** 拦截下载成功后的结果页（代替系统下载弹窗） */
+    private fun downloadDonePage(name: String, size: Int): String {
+        val kb = maxOf(1, size / 1024)
+        val safeName = android.text.TextUtils.htmlEncode(name)
+        return "<html><head><meta name='viewport' content='width=device-width'>" +
+            "<style>" +
+            "html,body{background:#121826;color:#F4F7FB;margin:0}" +
+            "body{font-family:sans-serif;padding:28px;line-height:1.8}" +
+            ".card{max-width:680px;margin:8vh auto;padding:26px;border:1px solid #334155;" +
+            "border-radius:16px;background:#1E293B;box-shadow:0 8px 30px #0008}" +
+            ".ok{color:#86EFAC;font-size:14px;font-weight:bold}" +
+            ".name{margin:14px 0;word-break:break-all;font-size:20px;color:#FFFFFF}" +
+            ".meta{color:#CBD5E1;font-size:14px}" +
+            ".tip{color:#94A3B8;font-size:13px;margin-top:20px}" +
+            "</style></head><body><div class='card'>" +
+            "<div class='ok'>下载完成</div>" +
+            "<div class='name'>$safeName</div>" +
+            "<div class='meta'>$kb KB</div>" +
+            "<div class='tip'>可在右上角菜单「下载文件」中查看，返回上一页继续浏览。</div>" +
+            "</div></body></html>"
+    }
+
+    /** 诊断用点击记录脚本（只读不改页面） */
+    private fun injectClickLogger() {
+        val js = """
+(function(){
+  if(window.__dzClickLog) return; window.__dzClickLog=1;
+  document.addEventListener('click',function(e){
+    try{
+      var n=e.target, found=null, hops=0;
+      while(n&&n.nodeType===1&&hops++<6){
+        if(/^(A|BUTTON|INPUT)$/.test(n.tagName)||n.getAttribute('onclick')){ found=n; break; }
+        n=n.parentNode;
+      }
+      if(!found) found=e.target;
+      if(!found||!window.DiscuzApp) return;
+      var oc=(found.getAttribute&&found.getAttribute('onclick')||'').slice(0,150);
+      var info=found.tagName+' | href='+(found.getAttribute&&found.getAttribute('href')||'')+' | onclick='+oc+' | text='+(found.textContent||'').trim().slice(0,40);
+      window.DiscuzApp.logClick(info);
+    }catch(err){}
+  },true);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * 论坛首页/帖子页「弹窗广告」自动屏蔽。
+     *
+     * 站点用的是 Discuz「popadv 弹出广告」插件：弹窗容器 #popadv_popmenu、遮罩 #popadv_popmask，
+     * 由外部 popadv.js 在 window.load 时调 popadv_load()→popadv_showadv() 显示。
+     *
+     * 屏蔽手段（三重）：
+     *  1) CSS `!important` 强制隐藏 #popadv_popmenu 与 #popadv_popmask（压过 JS 后设的 inline display:block）；
+     *  2) 包装 popadv_showadv/popadv_load 为空函数，从源头不让它弹、不创建遮罩；
+     *  3) MutationObserver 兜底：一旦遮罩/弹窗 DOM 出现即移除。
+     * 另保留对 Discuz 系统 fwin_ 广告浮层的兜底拦截，但不碰登录/购买附件等功能浮层。
+     */
+    private fun injectAdBlock() {
+        val js = """
+(function(){
+  if(window.__dzAdBlock) return; window.__dzAdBlock=1;
+
+  // 1) CSS 强制隐藏 popadv 弹窗 + 遮罩（!important 压过 JS 的 inline style）
+  var css='#popadv_popmenu,#popadv_popmask,[id^="popadv_"]{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}';
+  // 1b) 帖子正文图片：**不再隐藏**，按站点原生方式显示。
+  // 2) 包装 popadv 显示函数为空，从源头阻止弹出与遮罩创建
+  try{
+    window.popadv_showadv=function(){ return false; };
+    window.popadv_load=function(){ return false; };
+    window.popadv_closeadv=function(){ return false; };
+  }catch(e){}
+
+  // 3) 移除已存在的弹窗/遮罩节点 + 监听后续新增
+  function removeNode(id){
+    var el=document.getElementById(id);
+    if(el && el.parentNode){ el.parentNode.removeChild(el); }
+  }
+  function kill(){
+    removeNode('popadv_popmenu');
+    removeNode('popadv_popmask');
+  }
+  kill();
+  // 去抖：MutationObserver 回调在页面加载期会被触发成千上万次，若每次都跑全文档
+  // getElementById 尚可，但下面的 killFwinAll 是 querySelectorAll 全文档扫描，逐次执行会把
+  // 主线程 JS 拖死（这正是「进软件慢 / 打开帖子慢」的主因）。改为：变动只置脏标记，
+  // 由 250ms 定时器合并处理；并在页面稳定 10 秒后自动断开两个观察器，彻底停止开销。
+  var popadvDirty=false;
+  var mo=null;
+  try{
+    mo=new MutationObserver(function(){ popadvDirty=true; });
+    mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
+  }catch(e){}
+
+  if(!window.__sxsyFwinTimer){
+    window.__sxsyFwinTimer=setInterval(function(){
+      if(popadvDirty){
+        popadvDirty=false;
+        try{
+          var p=document.getElementById('popadv_popmenu');
+          if(p && p.style && p.style.display!=='none') p.style.display='none';
+          var m=document.getElementById('popadv_popmask');
+          if(m && m.style && m.style.display!=='none') m.style.display='none';
+        }catch(e){}
+      }
+      try{ killFwinAll(); }catch(e){}
+    },250);
+  }
+
+  // ---- Discuz 系统 fwin_ 广告浮层兜底（不碰功能浮层）----
+  var AD=/(下载|立即下载|douyin|抖音|app\b|推广|download|广告|ad\b)/i;
+  var FUNCTIONAL=/fwin_(register|login|logging|connect|attachpay|fwin_dialog_content|message|fwin_idcheck|recommend|secqaa|seccode|activation|credits)/i;
+  function killFwin(el){
+    if(!el || el.style.display==='none') return;
+    var id=el.id||'';
+    if(FUNCTIONAL.test(id)) return;
+    var txt=(el.textContent||'').slice(0,300);
+    if(!AD.test(txt) && !/fwin_(ad|adv|popup|app|download|douyin)/i.test(id)) return;
+    el.style.display='none';
+    var cover=document.getElementById('fwin_'+id.replace(/^fwin_/,'')+'_cover');
+    if(cover) cover.style.display='none';
+  }
+  function killFwinAll(){
+    var els=document.querySelectorAll('[id^="fwin_"]');
+    for(var i=0;i<els.length;i++) killFwin(els[i]);
+  }
+  killFwinAll();
+
+  // 页面稳定 10 秒后停止：断开观察器并清掉合并定时器（弹窗广告只会在加载初期出现）
+  setTimeout(function(){
+    try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+    try{ killFwinAll(); }catch(e){}
+    try{ if(window.__sxsyFwinTimer){ clearInterval(window.__sxsyFwinTimer); window.__sxsyFwinTimer=null; } }catch(e){}
+  },10000);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+
+    // ---------------- 附件真实文件名（下载重命名用） ----------------
+
+    /**
+     * 附件 id → 帖子内显示的真实文件名。
+     *
+     * 点附件下载时，DownloadListener 给的 contentDisposition 通常是 null，URL 又只是
+     * `forum.php?mod=attachment&aid=<base64>`（解析出来是脚本页名 `forum.php`），
+     * 原生侧**拿不到**用户想要的文件名。唯一可靠的来源是帖子 DOM 里显示的那个名字，
+     * 由 [injectAttachNameJs] 读出后按附件 id 上报到这里（见 JS 桥 `attachName`）。
+     *
+     * 只在内存保留，页面跳转自然覆盖，无需清理策略。
+     */
+    private val attachNames = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * **直链附件**的 URL → 原始文件名。
+     *
+     * 本站大量使用形如 `/data/attachment/forum/202610/09/221630f66g16b3rgcc3g65.txt` 的直链：
+     * URL 里既没有 aid、末段也只是哈希，名字只能从同一组 DOM 里读出来；
+     * 而原生侧下载用的就是这个 URL，所以直接用完整 URL 当键，下载时一定能对上号。
+     */
+    private val attachNamesByUrl = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+
+    /**
+     * 从附件下载 URL 求「附件 id」（与注入脚本 auditOf 同一套规则）：
+     * `?aid=<urlencode(base64)>` 解码后形如 `4563314|61f7b6c2|…`，取 `|` 前第一段；
+     * aid 本身是纯数字时直接用。
+     */
+    private fun auditIdOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val m = Regex("[?&]aid=([^&#]+)").find(url) ?: return null
+        val raw = try {
+            java.net.URLDecoder.decode(m.groupValues[1], "UTF-8")
+        } catch (e: Exception) { m.groupValues[1] }
+        if (raw.isNotEmpty() && raw.all { it.isDigit() }) return raw
+        return try {
+            // base64 里可能含 '+'，URLDecoder 会把它解成空格，需还原
+            val b64 = raw.replace(' ', '+')
+            val decoded = String(
+                android.util.Base64.decode(b64, android.util.Base64.DEFAULT),
+                Charsets.ISO_8859_1
+            )
+            decoded.substringBefore('|').filter { it.isLetterOrDigit() }.ifBlank { null }
+        } catch (e: Exception) { null }
+    }
+
+    /** 查附件 URL 对应的「帖子内文件名」，查不到返回 null */
+    private fun nameHintForUrl(url: String?): String? {
+        val id = auditIdOf(url) ?: return null
+        return attachNames[id]
+    }
+
+    /**
+     * **重命名总开关**。
+     *
+     * `true`（当前）：从页面 DOM 读出**附件的真实文件名**（`injectAttachNameJs`，
+     *   按附件 id 或直链完整 URL 建键），下载时用它；再去掉 `[sxsy.org]` /
+     *   `soushu2025.com` / `@` 等站点标记。
+     *   —— 必须开着：实测该站直链附件（`/data/attachment/forum/…/xxx.txt`）**没有
+     *   Content-Disposition**，文件名只存在于页面 DOM 里；关掉就只剩 URL 末段的哈希。
+     * `false`：只用文件本来的名字（响应头 / URL），仅做去前缀与扩展名兜底。
+     *
+     * 想切回「不重命名」只改这一处。
+     */
+    private val DOM_NAME_RENAMING = true
+
+    /**
+     * 下载文件名：**只用附件原来的名字**（按需求，帖子标题不再参与命名）。
+     *
+     * 名字来自帖子 DOM 里显示的那个文件名（[injectAttachNameJs] 按附件 id 上报），
+     * 站点标记 `[sxsy.org]` / `soushu2025.com` / `@` 由 [DownloadHelper.stripSiteWatermark] 去掉。
+     *
+     * 拿不到附件原名时返回 null —— 交给 [DownloadHelper.resolveFileName] 按
+     * 响应头 Content-Disposition → URL 兜底，**绝不拿帖子标题顶替**
+     * （多附件帖子标题是「求书，…」这类描述，用它会让所有文件同名）。
+     */
+    private fun preferredNameFor(url: String?): String? {
+        if (!DOM_NAME_RENAMING) return null          // 屏蔽重命名：用文件本来的名字，只去前缀
+        if (url.isNullOrBlank()) return null
+        nameHintForUrl(url)?.let { return it }
+        // 直链附件：按完整 URL 查，退化到路径部分（查询串可能不同）。
+        // 查不到就返回 null —— 绝不在多附件页面里随便挑一个名字用，那会让
+        // 「A 的文件存成B 的名字」，比用哈希名更糟。
+        attachNamesByUrl[url]?.let { return it }
+        val path = try {
+            Uri.parse(url).path
+        } catch (e: Exception) { null }
+        if (!path.isNullOrBlank()) attachNamesByUrl[path]?.let { return it }
+        return null
+    }
+
+    /**
+     * 上报帖子内附件的**原文件名**（下载命名第一优先级）。
+     *
+     * 站点实测有两种附件块形态（`sxsy45.com`）：
+     * ```
+     * ① 标准模板（搜书吧那种）：
+     * <dl class="tattl"><dd><p class="mbn"><span class="attachname">1.jpg</span></p>
+     *   <a href="forum.php?mod=attachment&aid=<base64>">下载</a></dd></dl>
+     *
+     * ② 尚香书苑（实测 18 个附件全是这种，**没有 .attachname**，且都是付费附件）：
+     * <dl class="tattl"><dt><img class="vm"></dt><dd>
+     *   <p class="attnm"><a href="forum.php?mod=misc&amp;action=attachpay&amp;aid=631539&amp;tid=327909"
+     *      onclick="showWindow('attachpay', this.href)">[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt</a></p>
+     *   <p>售价: <strong>1 金钱</strong> … [<a …action=viewattachpayments…>记录</a>] [<a …attachpay…>购买</a>]</p>
+     * </dd></dl>
+     * ```
+     * 形态 ② 里**真实文件名就是 `<a>` 的链接文字**，且链接是 `action=attachpay`（付费购买入口，
+     * 点它会走 App 自己的 `handleAttachPay` 购买流程）—— 所以**不能跳过 attachpay**，
+     * 否则一个文件名都拿不到；真正要跳过的只有 `viewattachpayments`（那个是「记录」）。
+     *
+     * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
+     */
+    /**
+     * 上报帖子内附件的**原文件名**，以及帖子标题。**只读不改名** —— 重命名规则在 Kotlin 侧
+     * 名字统一在 Kotlin 侧清洗（[DownloadHelper.stripSiteWatermark] 去站点标记），
+     * 这里只负责把 DOM 里的原始信息取出来。
+     *
+     * 站点实测有两种附件块形态（`sxsy45.com`）：
+     * ```
+     * ① 标准模板：
+     * <dl class="tattl"><dd><p class="mbn"><span class="attachname">1.jpg</span></p>
+     *   <a href="forum.php?mod=attachment&aid=<base64>">下载</a></dd></dl>
+     *
+     * ② 尚香书苑（实测 18 个附件全是这种，**没有 .attachname**，且都是付费附件）：
+     * <dl class="tattl"><dt><img class="vm"></dt><dd>
+     *   <p class="attnm"><a href="forum.php?mod=misc&amp;action=attachpay&amp;aid=631539&amp;tid=327909"
+     *      onclick="showWindow('attachpay', this.href)">[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt</a></p>
+     *   <p>售价: <strong>1 金钱</strong> … [<a …action=viewattachpayments…>记录</a>] [<a …attachpay…>购买</a>]</p>
+     * </dd></dl>
+     * ```
+     * 形态 ② 里**真实文件名就是 `<a>` 的链接文字**，且链接是 `action=attachpay`（付费购买入口，
+     * 点它会走 App 自己的 `handleAttachPay` 购买流程）—— 所以**不能跳过 attachpay**，
+     * 否则一个文件名都拿不到；真正要跳过的只有 `viewattachpayments`（那个是「记录」）。
+     *
+     * 上报键用附件 id：尚香是纯数字 `aid=631539`，搜书吧是 base64，两种都支持（见 [auditIdOf]）。
+     */
+    private fun injectAttachNameJs() {
+        val js = """
+(function(){
+  if(window.__dzAttNameInit) return; window.__dzAttNameInit=1;
+  var reported={};
+
+  function norm(s){ return String(s==null?'':s).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim(); }
+
+  // 通用占位文字（不是文件名）：下载/购买/记录/免费…
+  function isGeneric(t){
+    return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|购买|记录|查看|下载附件|点击文件名下载附件|download|attach|attachment)$/i.test(t);
+  }
+
+  // 文件链接判定：
+  //   mod=attachment / attachment.php        —— 带 aid 的标准/付费附件
+  //   /data/attachment/...                   —— **直链附件**（本站实际大量使用，形如
+  //     https://sxsy45.com/data/attachment/forum/202610/09/221630f66g16b3rgcc3g65.txt）
+  //     这种链接 URL 里没有 aid、末段只是哈希，名字**只能**从同一组 DOM 里取，
+  //     所以要单独上报并以「完整 URL」为键（原生侧下载用的就是这个 URL，能直接对上）。
+  // 排除 action=viewattachpayments（那是「记录」页，不是文件）
+  function isFileLink(href){
+    if(!href) return false;
+    if(/viewattachpayments/i.test(href)) return false;
+    return /mod=attachment/i.test(href) || /attachment\.php/i.test(href) ||
+           /action=attachpay/i.test(href) || /\/data\/attachment\//i.test(href);
+  }
+
+  // 从 href 求 Discuz 附件 id（纯数字 aid，或 base64 解码后取第一段）
+  function auditOf(href){
+    try{
+      var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
+      if(!m) return '';
+      // 先百分号解码，再把残留空格还原成 base64 的 '+'（Discuz 把 '+' 编码为 %2B，
+      // 不受影响；只在服务器漏编码时兜底），避免 '+' 被当成空格导致解码失败。
+      var raw=decodeURIComponent(m[1]).replace(/ /g,'+');
+      if(/^[0-9]+${'$'}/.test(raw)) return raw;
+      var txt='';
+      try{ txt=atob(raw); }catch(e){ return ''; }
+      var id=(txt.split('|')[0]||'').replace(/[^0-9A-Za-z]/g,'');
+      return id;
+    }catch(e){ return ''; }
+  }
+
+  // 取到名字后再统一剥掉首尾可能粘着的通用词：
+  // 有些模板把「下载」和文件名放在同一个文本节点里（中间没空格），
+  // 直接取整段会得到「下载某替身使者的上条当麻.txt」这种带前缀的名字。
+  function nameOf(a){
+    var t=norm(nameOfInner(a));
+    if(!t) return '';
+    t=t.replace(/^(下载|点击下载|立即下载|下载附件|附件|免费|查看)\s*/,'')
+        .replace(/\s*(下载附件|附件|下载)$/,'')
+        .trim();
+    return t;
+  }
+
+  // 从链接所在容器找真实文件名（**原样**，不做去标记/去扩展名）
+  function nameOfInner(a){
+    try{
+      var box=null;
+      try{
+        box = (a.closest && (a.closest('dl.tattl') || a.closest('.pattl'))) || null;
+      }catch(e){ box=null; }
+      if(!box){
+        // 模板差异兜底：逐级上溯找工作里含 .attachname 的容器
+        var n=a, hops=0;
+        while(n && n.nodeType===1 && hops++<6){
+          if(n.querySelector && n.querySelector('.attachname')){ box=n; break; }
+          n=n.parentElement;
+        }
+        // 连 tattl/pattl 都没有（**直链附件常见**：<a href="/data/attachment/…">下载</a>
+        // 外面只有一层 <p>）：把父元素当容器，继续在**容器文本**里找文件名。
+        // 少了这一步，容器为 null 时会直接返回空 → 整页取不到名字（实测 shub123 就是这样）。
+        if(!box) box = a.parentElement || a;
+      }
+      if(box){
+        // ① 标准模板：<span class="attachname">真实文件名</span>
+        var sp=box.querySelector('.attachname');
+        var t=norm(sp? sp.textContent : '');
+        if(!isGeneric(t)) return t;
+        // ② 尚香书苑形态：<p class="attnm"><a>真实文件名</a></p> —— 文件名就是链接文字
+        var pn=box.querySelector('p.attnm a');
+        if(pn){
+          var t2=norm(pn.textContent);
+          if(!isGeneric(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
+        }
+        // 兜底：容器 dd / .mbn / .attnm 内首个「像文件名」的文本（含扩展名）
+        var cands=box.querySelectorAll('dd,p,.mbn,.attnm');
+        for(var i=0;i<cands.length;i++){
+          var x=norm(cands[i].textContent);
+          if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
+        }
+        // 再兜底 ①：容器里的**叶子元素**（没有元素子节点）文本，以扩展名结尾者即文件名。
+        // 走叶子是为了**保留中文文件名里的空格**，例如「痴母素素 作者：qwert79268.txt」
+        // 若按空格切词会只拿到「作者：qwert79268.txt」。
+        var leaves=box.querySelectorAll('*');
+        for(var j=0;j<leaves.length;j++){
+          var e=leaves[j];
+          if(e.children && e.children.length>0) continue;
+          var t3=norm(e.textContent);
+          if(!isGeneric(t3) && t3.length<=120 && /\.[A-Za-z0-9]{1,6}$/.test(t3)) return t3;
+        }
+        // 再兜底 ②：文件名可能是**裸文本节点**（和「下载」链接并列），
+        // 这种只能把容器文本按空白/标点切词，找第一个以扩展名结尾的词。
+        var whole=norm(box.textContent);
+        if(whole && !isGeneric(whole)){
+          var parts=whole.split(/[\s,，;；|]+/);
+          for(var k2=0;k2<parts.length;k2++){
+            var tok=parts[k2].replace(/^[<("'《【\[]+/,'').replace(/[>)"'》】\],，。]+$/,'');
+            if(!isGeneric(tok) && tok.length<=100 && /\.[A-Za-z0-9]{1,6}$/.test(tok)) return tok;
+          }
+        }
+      }
+      // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
+      // ⚠ 必须**带扩展名**才算文件名：本站直链附件的按钮文字是「白嫖下载」，
+      //   没有扩展名，早期版本会把它当成文件名存下来。
+      var at=norm(a.textContent);
+      if(!isGeneric(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
+      var ti=norm(a.getAttribute && a.getAttribute('title'));
+      if(!isGeneric(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
+      return '';
+    }catch(e){ return ''; }
+  }
+
+  /**
+   * 有些第三方脚本（如用户自装的 `[discuz-dl]`）会把原始附件链接**换成直链**，
+   * 并把链接文字改成「白嫖下载」之类 —— 此时文件名在 DOM 里没有第二个来源。
+   * 这些脚本通常会把原名写在 data-* 或 download 属性上，这里逐一尝试。
+   */
+  function nameFromAttrs(a){
+    try{
+      var keys=['data-name','data-filename','data-file-name','data-title','data-original-name',
+                'data-origin-name','data-src-name','download','data-attname'];
+      for(var i=0;i<keys.length;i++){
+        var v=norm(a.getAttribute && a.getAttribute(keys[i]));
+        if(!isGeneric(v) && v.length<=160 && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(v)) return v;
+      }
+      // jQuery data 缓存：$(a).data('filename')
+      try{
+        if(window.jQuery){
+          var d=window.jQuery(a).data();
+          for(var k in d){
+            if(!Object.prototype.hasOwnProperty.call(d,k)) continue;
+            var dv=norm(d[k]);
+            if(typeof dv==='string' && !isGeneric(dv) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(dv)) return dv;
+          }
+        }
+      }catch(e2){}
+      return '';
+    }catch(e){ return ''; }
+  }
+
+  /**
+   * 最后的 widened 兜底：把搜索范围放到**整块帖子容器**里（`postmessage` / `tattl` / `pattl` /
+   * 楼层 td），找叶子元素里以扩展名结尾的文本。
+   * 用于「第三方脚本注入了直链、链接文字被换成『白嫖下载』」这类情形 ——
+   * 此时名字只能从同一楼层的原始附件块里捞回来。
+   */
+  function nameFromWideContainer(a){
+    try{
+      var sel='#postmessage_\\d+,#post_\\d+ \\.tattl,dl\\.tattl,dl\\.pattl,.tattl,.pattl,.attach_wrap,.attl';
+      var box=null, n=a, hops=0;
+      while(n && n.nodeType===1 && hops++<8){
+        if(n.querySelectorAll){
+          var f=null;
+          try{ f=n.matches(sel) ? n : null; }catch(e){ f=null; }
+          if(f){ box=n; break; }
+        }
+        n=n.parentElement;
+      }
+      if(!box) return '';
+      var leaves=box.querySelectorAll('*');
+      for(var i=0;i<leaves.length;i++){
+        var e=leaves[i];
+        if(e.children && e.children.length>0) continue;
+        var t=norm(e.textContent);
+        if(!isGeneric(t) && t.length<=160 && /\.[A-Za-z0-9]{1,6}$/.test(t)) return t;
+      }
+      return '';
+    }catch(e){ return ''; }
+  }
+
+  function scan(){
+    try{
+      if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
+      var links=document.querySelectorAll(
+        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"],a[href*="/data/attachment/"]');
+      var rows=0;
+      for(var i=0;i<links.length;i++){
+        var a=links[i], href=a.getAttribute('href')||'';
+        if(!isFileLink(href)) continue;
+        var nm=nameOf(a);
+        // 第三方脚本注入的直链：先看属性里有没有藏文件名，再放宽到整块帖子容器里找
+        if(!nm) nm=nameFromAttrs(a);
+        if(!nm) nm=nameFromWideContainer(a);
+        if(!nm) continue;
+        var id=auditOf(href);
+        if(id){
+          if(reported[id]) continue;
+          reported[id]=1;
+          try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
+        }else{
+          // 直链附件没有 aid → 用**绝对 URL** 做键上报；原生侧下载用的就是这个 URL，能直接对上
+          var key=a.href||href;
+          if(reported[key]) continue;
+          reported[key]=1;
+          try{ window.DiscuzApp.attachNameByUrl(key, nm); }catch(e){}
+        }
+        rows++;
+      }
+      // 通知原生「附件名已就绪」：购买成功后的自动下载要等这一刻才触发。
+      // 以前是在 onPageFinished 里同步触发的，那时本脚本还没跑完（evaluateJavascript 异步），
+      // 名字表是空的 → 多附件帖全部退回帖子标题 → 存成同一个名字。
+      // 同时把「候选链接数」一起报上去：候选多但取到名少 = 页面结构不同、nameOf 没认出来。
+      try{
+        if(window.DiscuzApp && window.DiscuzApp.attachNamesReady) window.DiscuzApp.attachNamesReady(rows, links.length);
+      }catch(e){}
+    }catch(e){}
+  }
+
+  function start(){
+    scan();
+    // 附件块可能由 AJAX/异步模板插入：监听只置脏位并合并处理，并限时 20 秒拆除，
+    // 避免「回调里扫全文档且永不停止」拖慢主线程。
+    var dirty=false, mo=null;
+    try{
+      mo=new MutationObserver(function(){ dirty=true; });
+      mo.observe(document.documentElement||document.body,{childList:true,subtree:true});
+    }catch(e){}
+    var iv=setInterval(function(){ if(dirty){ dirty=false; scan(); } },300);
+    setTimeout(function(){
+      try{ if(mo){ mo.disconnect(); mo=null; } }catch(e){}
+      try{ clearInterval(iv); }catch(e){}
+      scan();
+    },20000);
+  }
+
+  if(document.readyState==='complete') start();
+  else window.addEventListener('load', start);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("ATT", "已注入附件文件名上报脚本")
+    }
+
+
+    /**
+     * 用户自定义 JS 脚本（设置页「自定义脚本（JS）」）：每次页面加载完成后注入执行一次，空则不注入。
+     *
+     * 脚本在页面上下文里运行，可访问 `DiscuzApp` 桥（下载、购买、上报等）。
+     * 与内置脚本一样是**独立的一次 evaluateJavascript 调用**，所以用户脚本自身写错
+     * （语法错误）时只会让这一次调用失败，不会影响上面几个内置脚本。
+     */
+    private fun injectCustomJs() {
+        val custom = Prefs.getCustomJs(this).trim()
+        if (custom.isEmpty()) return
+        webView.evaluateJavascript(custom, null)
+        DebugLog.log("SCRIPT", "已注入自定义脚本（${custom.length} 字符）")
+    }
+
+    /**
+     * 页面清理：摘掉「外链推广分区」（Discuz redirect 型，官方文案「链接到外部地址」）
+     * + 残留的弹窗广告节点。
+     *
+     * 规则与脚本都在 [AdBlocker] 里；这里只负责按需注入并打日志。
+     * 注意：**只在 onPageFinished（文档完整解析后）执行**，且脚本内部只处理
+     * `table.fl_tb` 里的 `td.fl_g` 格子。论坛页里塞广告图片/区块链接是外链分区自身的性质，
+     * 只有整块格子（或整行）被摘掉、该行仍留有其它非广告内容时才保留，
+     * 这样广告消失且不影响正常帖子的图文排版。
+     * 早于此（onPageCommitVisible）或按「空行」全文档清理都会误伤帖子页的布局表格 —— 会显示错位。
+     */
+    private fun injectForumCleanup() {
+        val js = AdBlocker.cleanupJs()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("AD", "已注入清理脚本（外链分区按官方文案识别）")
+    }
+
+    /**
+     * 「每日签到」自动完成（k_misign 插件，带算术验证）。
+     *
+     * 流程：点签到入口（顶部 #k_misign_topb 图标 / 完整签到页 .J_chkitot）→ ajaxget
+     * 请求 operation=qiandao，服务器若开启算术验证会返回一段含 prompt("X+Y=?") 的脚本。
+     * 这里包装 window.prompt：当提示文本里能提取出「数字 运算符 数字」算式时，
+     * 自动算出答案返回（不弹真实输入框），签到流程据此自动完成。
+     *
+     * 触发：任意页面加载后，检测到签到入口且今天未签到时自动点击（全局包装 prompt，
+     * 因为首页顶部入口触发算术题也走 prompt）。用 localStorage 记录「当天已签到」避免重复点。
+     */
+    private fun injectAutoSign() {
+        val js = """
+(function(){
+  if(window.__dzAutoSign) return; window.__dzAutoSign=1;
+
+  // 从提示文本提取算式并计算（支持 + - × x * ÷ /，数字可多位）
+  function calcAnswer(msg){
+    var m = String(msg||'').replace(/[=\?？\s]/g,'').match(/(\d+)([+\-xX×*÷\/])(\d+)/);
+    if(!m) return null;
+    var a = parseInt(m[1],10), b = parseInt(m[3],10), op = m[2], r;
+    if(op==='+') r = a + b;
+    else if(op==='-') r = a - b;
+    else if(op==='x'||op==='X'||op==='×'||op==='*') r = a * b;
+    else if(op==='÷'||op==='/') r = (b===0 ? 0 : a / b);
+    else return null;
+    return String(r);
+  }
+
+  // 全局包装 prompt：算术验证时自动算答案（首页/签到页都生效）
+  try{
+    var _origPrompt = window.prompt;
+    window.prompt = function(msg, def){
+      try{
+        var ans = calcAnswer(msg);
+        if(ans !== null){
+          if(window.DiscuzApp) window.DiscuzApp.signNotice('签到验证已自动计算：'+msg+' = '+ans);
+          return ans;
+        }
+      }catch(e){}
+      return (typeof _origPrompt==='function') ? _origPrompt.apply(this, arguments) : null;
+    };
+  }catch(e){}
+
+  // 是否「今天已签到」：localStorage 记录，避免重复点
+  function todayKey(){
+    var d=new Date();
+    return 'sign_' + d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate();
+  }
+  function markSigned(){ try{ localStorage.setItem(todayKey(), '1'); }catch(e){} }
+  function isSignedToday(){ try{ return localStorage.getItem(todayKey())==='1'; }catch(e){ return false; } }
+
+  // 找签到入口：完整签到页按钮优先，其次首页顶部图标
+  function findEntry(){
+    var a = document.querySelector('a.J_chkitot') || document.querySelector('.J_chkitot');
+    if(a) return a;
+    var top = document.getElementById('k_misign_topb');
+    if(top){ var link = top.querySelector('a[href*="operation=qiandao"]'); if(link) return link; }
+    var img = document.getElementById('fx_checkin_b');
+    if(img){ var p = img.closest('a'); if(p && /qiandao/.test(p.getAttribute('href')||'')) return p; }
+    return null;
+  }
+
+  // 自动点击签到入口
+  var tries = 0;
+  function clickSign(){
+    if(isSignedToday()) return;
+    var a = findEntry();
+    if(a){
+      // 已签到状态下图标常会变（无 qiandao 链接），findEntry 找不到即不会误点
+      if(window.DiscuzApp) window.DiscuzApp.signNotice('自动签到：已触发签到');
+      try{ a.click(); }catch(e){}
+      markSigned();  // 乐观标记，避免同一页面重复触发；真正结果由服务器决定
+      return;
+    }
+    if(tries++ < 30){ setTimeout(clickSign, 500); }
+  }
+  setTimeout(clickSign, 1500);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * 付费附件点击拦截：站点的 showWindow('attachpay') 弹窗在本 WebView 失效且会
+     * 阻止默认导航，导致 shouldOverrideUrlLoading 收不到 attachpay 请求。故在 JS 层
+     * 捕获阶段拦截 attachpay 链接点击，preventDefault 后经桥交原生完成购买+下载。
+     */
+    private fun injectAttachPayHook() {
+        val js = """
+(function(){
+  if(window.__dzAttachPayHook) return; window.__dzAttachPayHook=1;
+  document.addEventListener('click', function(e){
+    var n = e.target, hops = 0;
+    while(n && n.nodeType===1 && hops++<8){
+      var href = (n.getAttribute && n.getAttribute('href')) || '';
+      if(href.indexOf('attachpay') >= 0){
+        e.preventDefault();
+        e.stopPropagation();
+        try{
+          if(window.DiscuzApp) window.DiscuzApp.buyAttachment(href);
+          else if(window.console) console.log('[attachpay-hook] 无桥，href='+href);
+        }catch(err){}
+        return;
+      }
+      n = n.parentNode;
+    }
+  }, true);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * 「自动购买附件」注入：仅当设置里开启时执行。
+     *
+     * 逻辑：检测 Discuz 的「购买附件」浮层（标题含"购买附件"，含"售价(金币)：N"和
+     * "购买后余额(金币)：M"），读取价格与余额，价格 > 0 且未超过用户设定的上限、
+     * 且余额够时，自动点击浮层内的"购买附件"按钮，并经 JS 桥回 App 弹 Toast 告知。
+     *
+     * 安全护栏：
+     *  1. 浮层必须同时出现"购买附件"标题 + "售价" + "购买后余额"三个特征才点；
+     *  2. 单次售价 <= Prefs.autoPayMaxPrice 才点；
+     *  3. 同一浮层只点一次（data-autopaid 标记防重）；
+     *  4. 仅作用于最顶层可见浮层（"display!=='none' 且 z-index 较高"）。
+     *
+     * 站点的购买表单提交与"购买成功"提示由 Discuz 自带 JS 处理；
+     * 购买成功后附件区会变成可下载，用户再点一次附件即真下载文件。
+     */
+    private fun tryAutoPay() {
+        if (!Prefs.isAutoPayAttachment(this)) return
+        val maxPrice = Prefs.getAutoPayMaxPrice(this)
+        if (maxPrice <= 0) return
+        val js = """
+(function(){
+  // 同一页面只注入一次；全局标记防重复
+  if(window.__sxsyAutopayActive) return; window.__sxsyAutopayActive=1;
+  var MAX=$maxPrice;
+  var LIFETIME=0;          // 已存活毫秒
+  var lastAttemptTs=0;     // 上次尝试处理浮层时间
+  var handledAny=0;        // 是否已处理过浮层
+
+  function visible(el){
+    if(!el) return false;
+    if(el.style.display==='none') return false;
+    if(el.offsetParent===null && el.style.visibility!=='visible') return false;
+    return true;
+  }
+  function findFloat(){
+    // Discuz showWindow('attachpay') 生成的购买浮层：外壳 #fwin_attachpay / .fwin 等
+    var cands=[];
+    var e1=document.getElementById('fwin_attachpay'); if(e1) cands.push(e1);
+    var els=document.querySelectorAll('.fwin,[id*="attachpay"],#fwin_layer_body,div[class*="fwin"]');
+    for(var i=0;i<els.length;i++){ if(cands.indexOf(els[i])<0) cands.push(els[i]); }
+    for(var k=0;k<cands.length;k++){
+      var c=cands[k]; if(!c || !visible(c)) continue;
+      var t=(c.innerText||c.textContent||'');
+      // 购买确认浮层一定有"购买附件"标题；正文会含售价/作者所得等
+      if(t.indexOf('购买附件')>=0 && t.indexOf('售价')>=0) return c;
+    }
+    return null;
+  }
+  function extractInt(t,re){var m=re.exec(t);return m?parseInt(m[1],10):NaN;}
+
+  // 在浮层内找“确认购买”按钮（Discuz 文案可能是「购买」或「购买附件」），排除「关闭/取消」
+  function findPayButton(f){
+    var btns=f.querySelectorAll('button,a,input[type="submit"],input[type="button"],input[type="image"]');
+    for(var k=0;k<btns.length;k++){
+      var b=btns[k];
+      if(!visible(b)) continue;
+      var bt=((b.innerText||b.textContent||'')+' '+(b.value||'')).replace(/[ \t\r\n]/g,'');
+      if(!bt) continue;
+      if(bt.indexOf('关闭')>=0 || bt.indexOf('取消')>=0) continue;
+      if(bt.indexOf('购买')>=0) return b;
+    }
+    return null;
+  }
+
+  function tryHandle(){
+    try{
+      var f=findFloat();
+      if(!f) return false;
+      if(f.getAttribute('data-autopaid')==='1') return true; // 已点过，不必再点
+      var txt=(f.innerText||f.textContent||'').replace(/[ \t\r\n]/g,'');
+      var price=extractInt(txt,/(?:售价[（(]?金币[）)]?[^0-9]*[:：]?)(\d+)/);
+      if(isNaN(price) || price<=0) return true;              // 已购/免费浮层，不处理
+      if(price>MAX) return true;                             // 超上限，留给用户手动
+      var bal=extractInt(txt,/(?:购买后余额[（(]?金币[）)]?[^0-9]*[:：]?)(\d+)/);
+      if(!isNaN(bal) && bal<price) return true;              // 金币不够
+      var payBtn=findPayButton(f);
+      if(!payBtn) return true;
+      f.setAttribute('data-autopaid','1');
+      try{if(window.DiscuzApp&&window.DiscuzApp.onAutopayNotice) window.DiscuzApp.onAutopayNotice(price,isNaN(bal)?-1:bal);}catch(_){}
+      try{payBtn.click();}catch(_){}
+      DebugLogSafe('已自动点购买附件: 售价'+price+'/余额'+bal);
+      return true;
+    }catch(_){return false;}
+  }
+
+  // 页面内日志（经 DiscuzApp 或直接 console，供诊断）
+  function DebugLogSafe(msg){
+    try{
+      if(window.DiscuzApp&&window.DiscuzApp.logClick) window.DiscuzApp.logClick('AUTOPAY|'+msg);
+      if(window.console) console.log('[sxsy-autopay]',msg);
+    }catch(_){}
+  }
+
+  // 持续轮询：购买浮层是用户点附件后由 showWindow AJAX 异步弹出，
+  // 因此需要监听一段时间。为省电省 CPU：真正 clearInterval 停止，且只在页面可见时轮询。
+  var timer=setInterval(function(){
+    LIFETIME+=400;
+    try{
+      // 页面不可见（切到别的界面）时跳过本轮，避免后台空转
+      if(document.hidden) return;
+      var hasAttachPayLink=!!document.querySelector('a[href*="attachpay"]');
+      if(!handledAny && tryHandle()){
+        handledAny=1;
+      }
+      // 已点过购买 或 普通页面(无任何付费附件迹象)超时：真正停掉轮询
+      if(handledAny || (!hasAttachPayLink && LIFETIME>12000)){
+        window.__sxsyAutopayActive=0;
+        clearInterval(timer);
+      }
+    }catch(_){}
+  },400);
+
+  // 初次立刻尝试一次（若浮层已由服务器端直接渲染而非 AJAX）
+  try{ if(!handledAny && tryHandle()) handledAny=1; }catch(_){}
+})();
+""".trimIndent()
+        try {
+            webView.evaluateJavascript(js, null)
+            DebugLog.log("AUTOPAY", "注入自动购买检测脚本（maxPrice=$maxPrice）")
+        } catch (e: Exception) {
+            DebugLog.log("AUTOPAY", "注入失败: ${e.message}")
+        }
+    }
+
+    // ---------------------------------------------------------------- 派生页面独立界面
+
+    /**
+     * 目标地址是否是「帖子」页：
+     * Discuz 三种形态 —— forum.php?mod=viewthread&tid=xx / thread-xx-1-1.html / viewthread.php?tid=xx
+     */
+    private fun isThreadUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val l = url.lowercase()
+        if (!l.startsWith("http")) return false
+        if (l.contains("mod=viewthread")) return true
+        if (l.contains("viewthread.php")) return true
+        return Regex("/thread-\\d+(-[\\d-]+)*\\.html").containsMatchIn(l)
+    }
+
+    /**
+     * 是否是「派生页面」——从版面列表点进去，会另开一个列表/详情内容的页面。
+     *
+     * 除了帖子本身，还有两类同样会把列表文档顶掉（返回后只剩第一页）：
+     *  - 主题分类筛选：挂在帖子名旁边的分类 tag（如 [纯爱]）
+     *    → forum.php?mod=forumdisplay&fid=x&filter=typeid&typeid=y
+     *  - 标签页：帖子里的 tag → misc.php?mod=tag&id=x
+     * 它们本质上是「另一个列表」，在同一个 WebView 里加载 = 版面列表被销毁；
+     * 而 Android WebView 不支持 BFCache，goBack 必然重建文档，站点 JS 追加的后续页必丢。
+     *
+     * 注意：版块自身的翻页（forum.php?mod=forumdisplay&fid=x&page=2）**不属于**派生页面 ——
+     * 那是列表自己换页，必须留在原界面内导航，否则点「下一页」会堆出一摞界面。
+     */
+    private fun isDerivedPageUrl(url: String?): Boolean =
+        isThreadUrl(url) || isDerivedListUrl(url)
+
+    /**
+     * 派生页面里「列表型」的那几种：标签页 / 主题分类筛选 / 淘帖专辑。
+     *
+     * 它们和版面列表一样会自动加载后续页（站点 JS 往 DOM 里追加），同样不能在别的界面里被顶掉，
+     * 否则返回时必回第一页。区分开来是为了控制界面堆叠深度，见 openDerivedPageInNewScreen。
+     */
+    private fun isDerivedListUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        if (isThreadUrl(url)) return false
+        val l = url.lowercase()
+        if (!l.startsWith("http")) return false
+        // 标签页 / 标签聚合页
+        if (l.contains("mod=tag")) return true
+        if (Regex("/tag-\\d+").containsMatchIn(l)) return true
+        // 主题分类 / 分类信息 / 精华 等筛选出来的「另一个列表」
+        if (l.contains("mod=forumdisplay") &&
+            (l.contains("filter=typeid") || l.contains("filter=sortid") || l.contains("filter=digest"))
+        ) return true
+        // 淘帖 / 专辑
+        if (l.contains("mod=collection")) return true
+        return false
+    }
+
+    /**
+     * 版面列表 → 帖子 / 分类标签 / 标签页：不在本界面内导航，而是新开一个独立界面承载它。
+     *
+     * 这样本界面（版面列表）只被覆盖、不被销毁：站点 JS 已经追加进 DOM 的后续页、
+     * 以及滚动位置都原样保留，返回时立刻就是离开前的样子 —— 不依赖任何还原脚本，
+     * 也就不会出现「只加载几页」或卡顿。
+     *
+     * 只在「当前不在派生页面」（或当前是列表型派生页而目标是帖子）时新开，
+     * 其余情况仍在本界面内导航，避免界面无界堆叠 —— 详见函数内注释。
+     * 已新开界面并需要拦截本次导航时返回 true。
+     *
+     * 命名说明：EXTRA_THREAD_MODE / threadMode / returningFromThreadScreen 是 1.3.19 的
+     * 历史命名（当时只用于帖子页），1.3.20 起覆盖全部派生页面（帖子 / 分类筛选 / 标签）。
+     */
+    private fun openDerivedPageInNewScreen(url: String): Boolean {
+        if (!isDerivedPageUrl(url)) return false                // 只对派生页面生效
+        if (!canStackAnotherScreen(url)) return false           // 已到堆叠上限 / 这一格该留在本界面
+        DebugLog.log("NAV", "派生页面新开独立界面（本界面留在后台）: $url 深度=${screenDepth + 1}")
+        return try {
+            startActivity(
+                Intent(this, MainActivity::class.java)
+                    .putExtra(EXTRA_OPEN_URL, url)
+                    .putExtra(EXTRA_THREAD_MODE, true)
+                    .putExtra(EXTRA_SCREEN_DEPTH, screenDepth + 1)
+            )
+            // 独立界面盖上来，本界面稍后会 onResume：标记住，别把当前页面重载成首页
+            returningFromThreadScreen = true
+            true
+        } catch (e: Exception) {
+            DebugLog.log("NAV", "新开独立界面失败，改为本界面内导航: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 是否该为 [url] 再开一层独立界面（堆叠上限 3 层，见 MAX_SCREEN_DEPTH）。
+     *
+     * 层与层的关系：
+     *   第 1 层 主界面 = 版面列表；第 2 层 = 列表型派生页（标签 / 分类筛选 / 淘帖）；
+     *   第 3 层 = 帖子。
+     *
+     * 规则（既要避免界面无界堆叠，又要让每一层列表都不被销毁）：
+     *  - 主界面：当前页已是派生页面时留在本界面内导航，否则开一层；
+     *    （列表 → 帖子这一格必须留在本界面内，这样从帖子返回能回到列表）
+     *  - 第 2 层（本界面入口是「列表型派生页」且当前仍停在该列表上）：目标是帖子时再开一层。
+     *    这就是「点分区里的帖子再返回，却退到总分区列表」的修复点 ——
+     *    旧代码开头一句 `if (threadMode) return false` 把这条分支彻底堵死，
+     *    帖子被塞进列表界面里加载，返回键又按「入口容忍」把它当成重定向残留，
+     *    直接关掉整个界面，于是越过列表掉回上一层。
+     *  - 第 3 层（帖子界面）及更深：一律本界面内导航（帖子互跳是常态，逐个开界面会堆一摞）。
+     */
+    private fun canStackAnotherScreen(url: String): Boolean {
+        val cur = lastContentPageUrl
+        if (!threadMode) {
+            return !isDerivedPageUrl(cur) || (isDerivedListUrl(cur) && isThreadUrl(url))
+        }
+        if (screenDepth >= MAX_SCREEN_DEPTH) return false          // 已到上限
+        if (!isDerivedListUrl(entryUrl)) return false              // 本界面承载的是帖子 → 留在界面内
+        return isDerivedListUrl(cur) && isThreadUrl(url)           // 停在该列表上且目标是帖子
+    }
+
+    /** 预热 WebView 内核，让冷启动后首次浏览更快 */
+    private fun warmUpWebView() {
+        webView.postDelayed({
+            try {
+                val warm = WebView(applicationContext)
+                warm.settings.javaScriptEnabled = true
+                warm.loadDataWithBaseURL(null, "", "text/html", "UTF-8", null)
+                warm.destroy()
+            } catch (e: Exception) { /* 预热失败不影响主流程 */ }
+        }, 300L)
+    }
+
+    /** 打开论坛首页（设置里配置的网址，为空用默认首页） */
+    private fun loadHome() {
+        homeErrorShown = false
+        loadUrl(Prefs.getHomeUrl(this))
+    }
+
+    private fun goHome() {
+        loadHome()
+    }
+
+    /** 判断是否为真实 http(s) 页面（排除 about:blank / data: / 空 url） */
+    private fun isRealHttpPage(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val low = url.lowercase()
+        return low.startsWith("http://") || low.startsWith("https://")
+    }
+
+    /** 记录浏览历史（仅真实 http(s) 页面） */
+    private fun recordHistory(view: WebView?, url: String?) {
+        if (url.isNullOrBlank() || !isRealHttpPage(url)) return
+        val title = (view?.title ?: webView.title)?.takeIf { it.isNotBlank() } ?: url
+        HistoryStore.add(this, url, title)
+    }
+
+    /** 判定“打不开”类网络错误码 */
+    private fun isEntryNetworkError(code: Int): Boolean {
+        return code == android.webkit.WebViewClient.ERROR_UNKNOWN ||
+            code == android.webkit.WebViewClient.ERROR_HOST_LOOKUP ||
+            code == android.webkit.WebViewClient.ERROR_CONNECT ||
+            code == android.webkit.WebViewClient.ERROR_TIMEOUT ||
+            code == android.webkit.WebViewClient.ERROR_IO ||
+            code == android.webkit.WebViewClient.ERROR_FAILED_SSL_HANDSHAKE
+    }
+
+    /** JS 桥接对象：浏览器通道（页面内 fetch）分块回传 */
+    private inner class DownloadBridge {
+
+        @JavascriptInterface
+        fun logClick(info: String?) {
+            if (!info.isNullOrBlank()) DebugLog.log("CLICK", info)
+        }
+
+        /**
+         * 页面清理脚本发现的「外链推广分区」fid（逗号分隔）转交 [AdBlocker] 记账。
+         *
+         * 这样站点新增外链分区时，**导航层拦截（面包屑/最新回复/搜索结果里的残留链接）
+         * 也会自动跟上**，不必改代码重装。参数来自页面自身文本，无需校验。
+         */
+        @JavascriptInterface
+        fun reportExternalForums(csv: String?) {
+            if (csv.isNullOrBlank()) return
+            AdBlocker.rememberExternalFids(csv)
+        }
+
+        /**
+         * 页面清理脚本上报的外链分区名，让拦截提示能说出具体是哪个分区（如「黄果短剧是外链推广站」）。
+         */
+        @JavascriptInterface
+        fun reportExternalForumName(fid: Int, name: String?) {
+            AdBlocker.rememberForumName(fid, name)
+        }
+
+        /** 自动签到结果提示 */
+        @JavascriptInterface
+        fun signNotice(msg: String?) {
+            if (msg.isNullOrBlank()) return
+            DebugLog.log("SIGN", msg)
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+            }
+        }
+
+        /** JS 拦截到的付费附件链接：交给原生完成购买+下载 */
+        @JavascriptInterface
+        fun buyAttachment(url: String?) {
+            if (url.isNullOrBlank()) return
+            if (!isTrustedJsUrl(url)) {
+                DebugLog.log("SEC", "拒绝非白名单购买调用: $url")
+                return
+            }
+            runOnUiThread { handleAttachPay(url) }
+        }
+
+        /** JS 找到已生效的附件下载链接：直接交原生下载 */
+        @JavascriptInterface
+        fun directDownload(url: String?, name: String?, aid: String?) {
+            if (url.isNullOrBlank()) return
+            if (!isTrustedJsUrl(url)) {
+                DebugLog.log("SEC", "拒绝非白名单下载调用: $url")
+                return
+            }
+            // 多文件帖子必须**按附件身份**命名，不能靠"页面上随便找一个链接"。
+            // JS 定位链接时已经算好了这个附件的名字，一并带过来；
+            // aid 也带过来作为兜底键（购买后的下载 URL 里 aid 是 base64 签名，
+            // 万一解不出来还能按纯数字 id 从名字表里查）。
+            // ⚠ 重命名被屏蔽时（DOM_NAME_RENAMING=false）这两个都不采纳 —— 只留文件本来的名字。
+            directNameHint = if (DOM_NAME_RENAMING) name?.trim()?.takeIf { it.isNotEmpty() && it.length <= 160 } else null
+            directAid = if (DOM_NAME_RENAMING) aid?.trim()?.takeIf { it.isNotEmpty() } else null
+            runOnUiThread { onDownloadStart(url, null, null) }
+        }
+
+        /** 注入脚本扫完一轮附件名后的回调：用于等名字就绪再触发购买后的自动下载 */
+        @JavascriptInterface
+        fun attachNamesReady(count: Int, candidates: Int) {
+            DebugLog.log("ATT", "附件名就绪：取到名 $count 个 / 候选链接 $candidates 个")
+            // 名字就绪后再触发「购买后自动下载」。以前是在 onPageFinished 里**同步**触发的，
+            // 那时注入脚本还没跑完（evaluateJavascript 异步 + load 事件 + 300ms 合并扫描），
+            // 名字表是空的 → 多附件帖子全部退回帖子标题 → 存成同一个名字。
+            if (pendingDownloadAid != null) runOnUiThread { tryAutoDownloadAfterBuy() }
+        }
+
+        @JavascriptInterface
+        fun fetchBegin(cd: String?, mime: String?) {
+            val u = pendingFetchUrl ?: return
+            fetchNameHint = preferredNameFor(u)
+            fetchFileName = try {
+                DownloadHelper.resolveFileName(u, if (cd.isNullOrBlank()) null else cd, fetchNameHint)
+            } catch (e: Exception) { "download_" + System.currentTimeMillis() }
+            // 大文件改**流式落盘**：每块 base64 立刻解码追加到临时文件，
+            // 不再把整个文件的 base64 攒在 StringBuilder 里、最后一次性解码。
+            // 旧写法对 10MB+ 的 TXT 会把内存峰值推到几十 MB（base64 串 + 解码后的整块字节数组），
+            // 手机上直接失败——这正是「大 txt 下载失败」的原因。
+            fetchTemp?.delete()
+            fetchTemp = try {
+                DownloadHelper.createBrowserTempFile(this@MainActivity)
+            } catch (e: Exception) { null }
+            fetchSize = 0L
+            DebugLog.log(
+                "FETCH",
+                "浏览器通道命名: $fetchFileName | cd=$cd | mime=$mime | hint=$fetchNameHint | 流式落盘"
+            )
+        }
+
+        /**
+         * 附件真实文件名上报（注入脚本从帖子 DOM 的 `<p class="attnm">` / `.attachname` 读出）。
+         * 点下载时 contentDisposition 为 null、URL 只是脚本页，原生侧只能靠这里拿到帖子里的文件名。
+         */
+        @JavascriptInterface
+        fun attachName(auditId: String?, name: String?) {
+            if (auditId.isNullOrBlank() || name.isNullOrBlank()) return
+            val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
+            if (clean.isEmpty() || clean.length > 120) return
+            attachNames[auditId.trim()] = clean
+            DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
+        }
+
+        /**
+         * **直链附件**的原始文件名上报（键是完整 URL）。
+         * 直链没有 aid，只能以 URL 为键；原生侧下载用的就是同一个 URL，所以一定对得上。
+         */
+        @JavascriptInterface
+        fun attachNameByUrl(url: String?, name: String?) {
+            if (url.isNullOrBlank() || name.isNullOrBlank()) return
+            val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
+            if (clean.isEmpty() || clean.length > 160) return
+            attachNamesByUrl[url.trim()] = clean
+            DebugLog.log("ATT", "直链附件名上报: ${url.trim().takeLast(40)} -> $clean")
+        }
+
+
+        @JavascriptInterface
+        fun fetchChunk(part: String?) {
+            if (part.isNullOrEmpty()) return
+            val file = fetchTemp ?: return
+            try {
+                fetchSize = DownloadHelper.appendBase64Chunk(file, part, fetchSize)
+            } catch (e: Exception) {
+                DebugLog.log("FETCH", "分块写入失败: ${e.message}")
+                fetchTemp?.delete()
+                fetchTemp = null
+            }
+        }
+
+        @JavascriptInterface
+        fun fetchEnd() {
+            val temp = fetchTemp
+            fetchTemp = null
+            val size = fetchSize
+            fetchSize = 0L
+            if (temp == null || !temp.isFile || temp.length() <= 0L) {
+                temp?.delete()
+                runOnUiThread {
+                    DebugLog.log("FETCH", "没有收到数据")
+                    Toast.makeText(this@MainActivity, "下载失败：未收到文件数据", Toast.LENGTH_LONG).show()
+                }
+                return
+            }
+            runOnUiThread {
+                try {
+                    val savedName = DownloadHelper.saveFromFile(
+                        this@MainActivity, temp, fetchFileName, !fetchNameHint.isNullOrBlank()
+                    )
+                    fetchFileName = savedName
+                    DebugLog.log("FETCH", "保存成功: $savedName (${temp.length()}B)")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "下载完成：$savedName\n保存于 Download/${Prefs.getDownloadDir(this@MainActivity)}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } catch (e: Exception) {
+                    DebugLog.log("FETCH", "保存失败: ${e.message}")
+                    Toast.makeText(this@MainActivity, "保存失败：${e.message}", Toast.LENGTH_LONG).show()
+                } finally {
+                    temp.delete()
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun fetchFail(info: String?) {
+            DebugLog.log("FETCH", "失败: $info")
+            runOnUiThread {
+                Toast.makeText(
+                    this@MainActivity,
+                    "下载失败：服务器返回网页（${info ?: "未知原因"}）\n请确认已在论坛登录，附件权限足够",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        /**
+         * 自动购买回调：页面 JS 在确认要自动点"购买附件"按钮时调用此方法，
+         * 弹出 App 端 Toast 让用户知道即将扣金币（用户已在设置里开启才会触发）。
+         */
+        @JavascriptInterface
+        fun onAutopayNotice(price: Int, balance: Int) {
+            DebugLog.log("AUTOPAY", "即将自动扣 $price 金币购买附件 / 购买后余额 $balance")
+            runOnUiThread {
+                Toast.makeText(
+                    this@MainActivity,
+                    "自动购买：$price 金币（购买后余额 $balance）",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    // 浏览器通道状态
+    private var pendingFetchUrl: String? = null
+
+    /** 浏览器通道本次下载的「帖子内文件名」（null = 没有名字，按普通流程处理） */
+    private var fetchNameHint: String? = null
+    private var fetchFileName: String = ""
+    /** tryAutoDownloadAfterBuy 的 JS 已经算好的文件名（只服务这一次下载，用完即清） */
+    @Volatile private var directNameHint: String? = null
+
+    /** 同上：这次下载对应的附件 id（纯数字），用于按身份从名字表兜底查 */
+    @Volatile private var directAid: String? = null
+    /** 浏览器通道的临时文件：每块 base64 立刻解码追加到这里，fetchEnd 后落盘并删除 */
+    private var fetchTemp: java.io.File? = null
+    private var fetchSize: Long = 0L
+
+    /**
+     * 浏览器通道下载：原生请求被返回网页拦截时，改用页面内 fetch 获取文件，
+     * 分块 base64 经 JS 桥回传保存。
+     */
+    private fun runBrowserFetch(url: String) {
+        DebugLog.log("FETCH", "启动浏览器通道: $url")
+        Toast.makeText(this, "正在通过浏览器通道下载…", Toast.LENGTH_SHORT).show()
+        val safe = url.replace("\\", "\\\\").replace("'", "\\'")
+        val js = """
+(async function(){
+  try{
+    var seen={};
+    async function get(u, depth){
+      if(depth>5) throw new Error('下载跳转超过5层');
+      if(seen[u]) throw new Error('下载地址循环跳转');
+      seen[u]=1;
+      var r=await fetch(u,{credentials:'include',redirect:'follow'});
+      var ct=r.headers.get('content-type')||'';
+      if(/text\/html|xhtml/i.test(ct)){
+        var h=await r.text(), title='', target=null;
+        var doc=new DOMParser().parseFromString(h,'text/html');
+        var titleNode=doc.querySelector('title');
+        if(titleNode) title=(titleNode.textContent||'').trim();
+        var meta=doc.querySelector('meta[http-equiv="refresh"],meta[http-equiv="Refresh"]');
+        if(meta){
+          var mc=meta.getAttribute('content')||'';
+          var mi=mc.toLowerCase().indexOf('url=');
+          if(mi>=0) target=mc.substring(mi+4).trim().replace(/^['\"]|['\"]$/g,'');
+        }
+        if(!target){
+          var scripts=doc.querySelectorAll('script');
+          for(var si=0;si<scripts.length&&!target;si++){
+            var st=scripts[si].textContent||'';
+            var keys=['location.href','location.replace','window.location','window.open','open('];
+            for(var ki=0;ki<keys.length&&!target;ki++){
+              var pos=st.toLowerCase().indexOf(keys[ki].toLowerCase());
+              if(pos<0) continue;
+              var q1=st.indexOf("'",pos), q2=st.indexOf('"',pos);
+              var q=q1>=0 && (q2<0 || q1<q2) ? q1 : q2;
+              if(q>=0){
+                var end=st.indexOf(st.charAt(q),q+1);
+                if(end>q) target=st.substring(q+1,end);
+              }
+            }
+          }
+        }
+        if(!target){
+          var els=doc.querySelectorAll('a[href],form[action],iframe[src],button[data-url],*[data-href]');
+          for(var i=0;i<els.length;i++){
+            var el=els[i], x=el.getAttribute('href')||el.getAttribute('action')||el.getAttribute('src')||el.getAttribute('data-url')||el.getAttribute('data-href')||'';
+            var tx=((el.textContent||'')+' '+(el.getAttribute('onclick')||'')+' '+x);
+            var xl=x.toLowerCase();
+            var isSearch=xl.indexOf('search.php')>=0 || xl.indexOf('searchsubmit')>=0;
+            var isDownload=/(下载|重新下载|附件|download|attachment|\\.txt(?:[?#]|$)|\\.zip(?:[?#]|$)|\\.rar(?:[?#]|$))/i.test(tx);
+            if(x && !/^javascript:/i.test(x) && !isSearch && isDownload){ target=x; break; }
+          }
+        }
+        if(target){
+          target=target.replace(/&amp;/g,'&');
+          return await get(new URL(target,r.url).href,depth+1);
+        }
+        throw new Error((title||'服务器返回网页')+'：未找到下一层下载地址');
+      }
+      var cd=r.headers.get('content-disposition')||'';
+      // base64 单块大小：512KB。整块进 JS 桥的开销可控，也不会把 WebView 内存顶爆。
+      var P=524288;
+      // 单块 Uint8Array -> base64。分 32768 步拼二进制串，避开 String.fromCharCode 的参数上限。
+      function sendChunk(u8){
+        if(!u8 || !u8.length) return;
+        var bin='';
+        for(var k=0;k<u8.length;k+=32768){ bin+=String.fromCharCode.apply(null,u8.subarray(k,k+32768)); }
+        var enc=btoa(bin);
+        for(var j=0;j<enc.length;j+=P) window.DiscuzApp.fetchChunk(enc.substr(j,P));
+      }
+      window.DiscuzApp.fetchBegin(cd,ct);
+      // **流式**读取：fetch 的响应体边下边发，不把整个文件读进内存。
+      // 旧写法 `await r.arrayBuffer()` 会同时持有 ArrayBuffer + 二进制串 + base64 串，
+      // 10MB 的 TXT 峰值几十 MB，手机上内存吃紧直接失败（大文件下载失败的真凶）。
+      if(r.body && r.body.getReader){
+        var reader=r.body.getReader();
+        for(;;){
+          var res=await reader.read();
+          if(res.done) break;
+          sendChunk(res.value);
+        }
+      }else{
+        sendChunk(new Uint8Array(await r.arrayBuffer()));
+      }
+      window.DiscuzApp.fetchEnd();
+    }
+    await get('$safe',0);
+  }catch(e){ window.DiscuzApp.fetchFail(String(e)); }
+})();
+""".trimIndent()
+        pendingFetchUrl = url
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** 付费附件购买链接：forum.php?mod=misc&action=attachpay&aid=... */
+    private fun isAttachPayUrl(url: String): Boolean {
+        val l = url.lowercase()
+        return l.contains("action=attachpay") || l.contains("mod=attachpay")
+    }
+
+    /**
+     * 主动接管付费附件：自动购买 → 成功后自动下载。
+     * 站点 showWindow('attachpay') 弹窗在本 WebView 失效，故直接原生请求完成购买流程。
+     */
+    private fun handleAttachPay(url: String) {
+        var cleanUrl = url.replace("&amp;", "&")
+        if (!Prefs.isAutoPayAttachment(this)) {
+            Toast.makeText(this, "已开启自动购买才能下载付费附件", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val maxPrice = Prefs.getAutoPayMaxPrice(this)
+        val referer = lastContentPageUrl ?: webView.url
+        // JS 桥传进来的是相对路径（如 forum.php?mod=misc&action=attachpay...），
+        // 需要以当前帖子页为 base 解析成绝对 URL，否则 URL() 会抛 no protocol
+        if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
+            val base = referer?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+            cleanUrl = if (base != null) {
+                try { java.net.URL(java.net.URL(base), cleanUrl).toString() }
+                catch (e: Exception) { cleanUrl }
+            } else {
+                // 没有任何可用的 base（首启还没填网址）→ 直接放弃，**不猜任何域名**
+                DebugLog.log("BUY", "缺少 base 网址，无法解析相对路径: $cleanUrl")
+                Toast.makeText(this, "尚未设置论坛网址，无法处理附件", Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+        DebugLog.log("BUY", "接管付费附件: $cleanUrl | maxPrice=$maxPrice | referer=$referer")
+        Thread {
+            val result = DownloadHelper.buyAttachment(
+                cachedUserAgent, cleanUrl, referer, maxPrice
+            )
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (result.success && result.attachUrl != null) {
+                    // 购买成功后，帖子页附件链接才会变成可下载状态；刷新帖子页后
+                    // 由 onPageFinished 自动找该 aid 的下载链接并下载（否则直接拼的
+                    // mod=attachment 地址会因购买状态未同步返回「提示信息」错误页）
+                    val aid = Regex("aid=(\\d+)").find(result.attachUrl)?.groupValues?.get(1)
+                    if (aid != null) {
+                        pendingDownloadAid = aid
+                        Toast.makeText(this, "购买成功，正在刷新并下载…", Toast.LENGTH_SHORT).show()
+                        DebugLog.log("BUY", "购买成功，刷新帖子页后下载 aid=$aid")
+                        webView.reload()
+                    } else {
+                        Toast.makeText(this, "购买成功，正在下载…", Toast.LENGTH_SHORT).show()
+                        DebugLog.log("BUY", "购买成功，直接下载: ${result.attachUrl}")
+                        onDownloadStart(result.attachUrl, null, null)
+                    }
+                } else {
+                    Toast.makeText(this, result.message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    /** 购买成功后刷新了帖子页：自动找该 aid 已生效的下载链接并触发原生下载 */
+    private fun tryAutoDownloadAfterBuy() {
+        val aid = pendingDownloadAid ?: return
+        pendingDownloadAid = null
+        // 已购买附件链接在帖子页里通常是 <span id="attach_<数字aid>"> 内的
+        // <a href="...mod=attachment&aid=<base64签名>">，也有直接给纯数字 aid 的。
+        // ⚠️ 绝不能「取页面上任意一个 mod=attachment 链接」——多附件帖子里那会下到**别的附件**，
+        //    而且拿到的是别人的文件名（实测多文件帖全部命名错误就是这个兜底造成的）。
+        // 所以这里统一用「把 href 里的 aid 解出来 == 目标 aid」来精确匹配，并把
+        // 同一个容器里读到的文件名一起回传（见 directDownload(url, name)）。
+        val js = """
+(function(){
+  var aid='$aid';
+  var tries=0;
+  // 与注入脚本同一套 aid 解析：纯数字直接用，否则 base64 解码取第一段
+  function auditOf(href){
+    try{
+      var m=/[?&]aid=([^&#]+)/.exec(String(href||''));
+      if(!m) return '';
+      var raw=decodeURIComponent(m[1]).replace(/ /g,'+');
+      if(/^[0-9]+${'$'}/.test(raw)) return raw;
+      var txt='';
+      try{ txt=atob(raw); }catch(e){ return ''; }
+      return (txt.split('|')[0]||'').replace(/[^0-9A-Za-z]/g,'');
+    }catch(e){ return ''; }
+  }
+  function norm(s){ return String(s==null?'':s).replace(/ /g,' ').replace(/\s+/g,' ').trim(); }
+  function nameIn(a){
+    try{
+      var box=a.closest?a.closest('dl.tattl'):null;
+      var sp=box?box.querySelector('.attachname'):null;
+      var t=norm(sp?sp.textContent:'');
+      if(t && !/^(下载|附件|免费)$/.test(t)) return t;
+      var pn=box?box.querySelector('p.attnm a'):null;
+      if(pn){ var t2=norm(pn.textContent); if(t2 && /\.[A-Za-z0-9]{1,6}$/.test(t2)) return t2; }
+      var at=norm(a.textContent);
+      return at && !/^(下载|附件|免费)$/.test(at) ? at : '';
+    }catch(e){ return ''; }
+  }
+  function pick(){
+    var i,a,href,box;
+    // 1) 精确：attach_<aid> 容器内
+    box=document.getElementById('attach_'+aid);
+    if(box){
+      a=box.querySelector('a[href*="mod=attachment"]');
+      if(a){ href=a.getAttribute('href')||''; if(href){ fire(href, nameIn(a)); return true; } }
+    }
+    // 2) 全页扫描：只认「解出来的 aid == 目标 aid」的链接，绝不拿别人的
+    var all=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+    for(i=0;i<all.length;i++){
+      a=all[i];
+      href=a.getAttribute('href')||'';
+      if(!href || /attachpay/i.test(href)) continue;
+      if(auditOf(href)===aid){ fire(href, nameIn(a)); return true; }
+    }
+    return false;
+  }
+  function fire(href, name){
+    // 名称与附件 id 一起回传：多文件帖子里，名字必须跟「这一个附件」绑定，
+    // 不能出现「A 的文件用上B 的名字」的情况。
+    if(window.DiscuzApp && window.DiscuzApp.directDownload) window.DiscuzApp.directDownload(href, name||'', aid);
+  }
+  function report(){
+    var dump=[];
+    var any=document.querySelectorAll('a[href*="mod=attachment"],a[href*="attachment.php"]');
+    for(var k=0;k<any.length && k<6;k++) dump.push(any[k].getAttribute('href')||'');
+    if(window.DiscuzApp) window.DiscuzApp.signNotice('未找到该附件的下载链接，请手动点。页内链接: '+dump.join(' | '));
+  }
+  if(!pick()){
+    if(tries++ < 10){ setTimeout(function(){ if(!pick() && tries>=10) report(); }, 400); }
+    else report();
+  }
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** 论坛附件端点：不要把附件跳转页交给 WebView 渲染，直接走自研下载器 */
+    private fun isDirectAttachmentUrl(url: String): Boolean {
+        val l = url.lowercase()
+        return l.contains("mod=attachment") || l.contains("attachment.php")
+    }
+
+    private fun startDirectAttachment(url: String) {
+        DebugLog.log("DOWNLOAD", "直接接管附件: $url")
+        onDownloadStart(url, null, null)
+    }
+
+    /** 弹窗地址转发：空白页直接吞掉；附件直接下载；普通页面回主 WebView */
+    private fun forwardPopupUrl(url: String?) {
+        if (url.isNullOrBlank()) return
+        val lower = url.lowercase()
+        if (lower.startsWith("about:") || lower.startsWith("javascript:")) {
+            DebugLog.log("POPUP", "吞掉: $url")
+            return
+        }
+        if (AdBlocker.isAdUrl(url)) {
+            DebugLog.log("POPUP", "拦截广告弹窗: $url")
+            return
+        }
+        if (AdBlocker.isHiddenForumUrl(url)) {
+            DebugLog.log("POPUP", "拦截外链推广分区弹窗: $url")
+            return
+        }
+        if (isDirectAttachmentUrl(url)) {
+            startDirectAttachment(url)
+            return
+        }
+        // 版面列表 → 帖子/分类标签/标签页（window.open / target=_blank 形式）：同样新开独立界面承载
+        if (openDerivedPageInNewScreen(url)) return
+        // 畸形登录 URL 自愈：弹窗带出死循环地址时先归正
+        selfHealLoginUrl(url)?.let {
+            webView.loadUrl(it)
+            return
+        }
+        // 外部站点（弹窗/新窗口里打开的非论坛域名）一律拦截，不放回主 WebView
+        if (isExternalNavUrl(url)) {
+            DebugLog.log("NAV", "拦截外部站点(弹窗): $url")
+            return
+        }
+        DebugLog.log("POPUP", "转发普通页面到主 WebView: $url")
+        webView.loadUrl(url)
+    }
+
+    private fun onDownloadStart(url: String?, contentDisposition: String?, mimeType: String?) {
+        if (url.isNullOrBlank()) return
+        val httpUrl = if (url.startsWith("http://") || url.startsWith("https://")) {
+            url
+        } else {
+            val base = webView.url ?: return run {
+                Toast.makeText(this, "暂不支持此类下载链接", Toast.LENGTH_SHORT).show()
+            }
+            try {
+                java.net.URL(java.net.URL(base), url).toString()
+            } catch (e: Exception) {
+                Toast.makeText(this, "暂不支持此类下载链接", Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+        // 同一个 URL 刚被拦截器（或浏览器通道）存过 → WebView 又发起了一次下载，
+        // 不拦住就会存出两份（xxx(5).txt 与 xxx(6).txt），白占一倍空间。
+        //按需求**不弹提示**（静默跳过），只在诊断日志里留痕，方便排查。
+        if (!markHandled(httpUrl)) {
+            val already = savedNameOf(httpUrl)
+            DebugLog.log("DOWNLOAD", "跳过重复下载（已存为 ${already ?: "同名文件"}）: $httpUrl")
+            return
+        }
+        // Android 9 及以下写公共目录需要存储权限
+        if (Build.VERSION.SDK_INT <= 28 &&
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_STORAGE)
+            Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
+            return
+        }
+        // 命名来源优先级（**按附件身份**，绝不退化到"页面上随便一个名字"）：
+        //  1) directNameHint —— tryAutoDownloadAfterBuy 的 JS 在定位到这个附件时算好的名字；
+        //  2) directAid → attachNames[aid] —— 同一次调用的附件 id，名字表兜底；
+        //  3) preferredNameFor(url) —— 从下载 URL 的 aid 反查名字表，再退回帖子标题规则。
+        val jsHint = directNameHint?.takeIf { it.isNotBlank() }
+        val jsAid = directAid?.takeIf { it.isNotBlank() }
+        directNameHint = null
+        directAid = null
+        val byAid = jsAid?.let { attachNames[it] }
+        val hint = jsHint ?: byAid ?: preferredNameFor(httpUrl)
+        val fileName = try {
+            DownloadHelper.resolveFileName(httpUrl, contentDisposition, hint)
+        } catch (e: Exception) { "download_" + System.currentTimeMillis() }
+        DebugLog.log(
+            "DL",
+            "开始原生下载: $httpUrl | mime=$mimeType | cd=$contentDisposition | " +
+                "名字来源=" + (if (jsHint != null) "JS直传" else if (byAid != null) "名字表(aid=$jsAid)" else "名表/标题(${attachNames.size}条)") +
+                " | aid=${auditIdOf(httpUrl) ?: "?"} | hint=$hint | 命名=$fileName"
+        )
+        val nameDisplay = if (fileName.startsWith("download_")) "自动识别文件名" else fileName
+        Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
+        DownloadHelper.start(
+            this, webView.settings.userAgentString, httpUrl,
+            contentDisposition, webView.url, hint
+        ) { origUrl ->
+            runBrowserFetch(origUrl)
+        }
+    }
+
+    /** UA 由设置页开关决定，默认电脑版 */
+    private fun buildUserAgent(): String {
+        return if (Prefs.isDesktopMode(this)) {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        } else {
+            "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        }
+    }
+
+    /** 当前论坛的可信域名（含其子域）。取自设置里配置的网址。 */
+    private fun trustedHosts(): List<String> {
+        val base = try {
+            Uri.parse(Prefs.getHomeUrl(this)).host?.lowercase()?.trim()
+        } catch (e: Exception) { null }
+        if (base.isNullOrBlank()) return emptyList()
+        return listOf(base)
+    }
+
+    /** JS 桥调用白名单：相对路径放行（来自论坛页面，后续用论坛 referer 补全）；
+     *  绝对 URL 仅当 host 属于可信论坛域名时放行，拦截恶意页面诱导下载/扣费 */
+    private fun isTrustedJsUrl(url: String): Boolean {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+        val host = try { Uri.parse(url).host?.lowercase()?.trim() } catch (e: Exception) { null }
+            ?: return false
+        return trustedHosts().any { host == it || host.endsWith(".$it") }
+    }
+
+    /** URL 是否为「非论坛域名」的外部链接（可能带子域/同域） */
+    private fun isExternalNavUrl(url: String): Boolean {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return false
+        val hosts = trustedHosts()
+        if (hosts.isEmpty()) return false   // 未配置可信域（理论上不会走到）则放行
+        val h = try { Uri.parse(url).host?.lowercase()?.trim() } catch (e: Exception) { null }
+            ?: return false
+        return hosts.none { trusted ->
+            h == trusted || h.endsWith(".$trusted")
+        }
+    }
+
+    /** 拦截外部站点导航：命中则提示并 return true（不在 WebView / 系统浏览器打开） */
+    private fun interceptExternalNav(url: String): Boolean {
+        if (!isExternalNavUrl(url)) return false
+        DebugLog.log("NAV", "拦截外部站点: $url")
+        Toast.makeText(this, "已拦截外部链接", Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    /**
+     * 拦截指向「外链推广分区」的导航。
+     *
+     * 页面里的版块入口已由注入脚本摘掉，但面包屑、最新回复、搜索结果里仍可能留下这些 fid 的链接；
+     * 这类分区是 Discuz 的「外部链接（redirect）」型，进去就是站外推广站，一律就地拦下并给一句提示。
+     * 判据见 [AdBlocker]：fid 由页面里的官方文案「链接到外部地址」自动学习，无需硬编码。
+     */
+    private fun interceptHiddenForum(url: String): Boolean {
+        if (!AdBlocker.isHiddenForumUrl(url)) return false
+        val fid = AdBlocker.forumIdOf(url)
+        val name = AdBlocker.forumNameOf(fid)
+        DebugLog.log("NAV", "拦截外链推广分区: $url")
+        Toast.makeText(this, if (name != null) "「$name」是外链推广站，已屏蔽" else "该版块为外链推广站，已屏蔽", Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    /**
+     * 畸形 Discuz 登录 URL「自愈」：站内出现形如
+     *   https://host/index.php/member.php?mod=logging&action=login&referer=…
+     *   （index.php 被当成目录，旧版强制补斜杠后才会产生；Discuz 伪静态下 index.php/xxx
+     *   会触发登录回跳 referer 递归，最终 WebView 报 ERR_TOO_MANY_REDIRECTS）时，
+     *   去掉错误目录前缀把它归正为干净的登录地址，避免卡死。
+     * 返回规整后的 URL；无需处理则返回 null（正常 URL 一律不误伤）。
+     */
+    private fun selfHealLoginUrl(url: String): String? {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null
+        val hosts = trustedHosts()
+        if (hosts.isEmpty()) return null
+        val parsed = try { Uri.parse(url) } catch (e: Exception) { return null }
+        val h = parsed.host?.lowercase()?.trim() ?: return null
+        val trusted = hosts.any { h == it || h.endsWith(".$it") }
+        if (!trusted) return null
+        val path = parsed.path ?: ""
+        // 仅当 index.php 后面还跟着 /xxx（被当目录）才算畸形；末尾纯 /index.php 是正常首页
+        if (!Regex("(?i)^/index\\.php/").containsMatchIn(path)) return null
+        var fixedPath = path
+        while (Regex("(?i)^/index\\.php/").containsMatchIn(fixedPath)) {
+            fixedPath = fixedPath.replaceFirst(Regex("(?i)^/index\\.php/"), "/")
+        }
+        val healed = parsed.scheme + "://" + h + fixedPath +
+            (parsed.query?.let { "?$it" } ?: "") +
+            (parsed.fragment?.let { "#$it" } ?: "")
+        DebugLog.log("NAV", "畸形登录URL自愈: $url\n => $healed")
+        return healed
+    }
+
+    private fun handleUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return when {
+            lower.startsWith("http://") || lower.startsWith("https://") -> false
+            lower.startsWith("javascript:") -> true
+            lower.startsWith("about:") -> true
+            else -> {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (e: Exception) {
+                    Toast.makeText(this, "无法打开链接", Toast.LENGTH_SHORT).show()
+                }
+                true
+            }
+        }
+    }
+
+    private fun loadUrl(url: String) {
+        val normalized = Prefs.normalizeUrl(url)
+        lastLoadedUrl = url
+        webView.loadUrl(normalized)
+    }
+
+    private fun updateTitle() {
+        val t = webView.title
+        supportActionBar?.title = if (t.isNullOrBlank()) "Diszu论坛" else t
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu?): Boolean {
+        menuInflater.inflate(R.menu.menu_main, menu)
+        return true
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu?): Boolean {
+        menu?.findItem(R.id.action_debug)?.isVisible = DebugLog.isEnabled()
+        return super.onPrepareOptionsMenu(menu)
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            // 帖子独立界面标题栏的返回箭头 = 系统返回键
+            android.R.id.home -> { onBackPressed(); true }
+            R.id.action_stop -> { webView.stopLoading(); true }
+            R.id.action_refresh -> {
+                webView.clearCache(true)
+                webView.reload()
+                true
+            }
+            R.id.action_home -> { goHome(); true }
+            R.id.action_downloads -> {
+                startActivity(Intent(this, DownloadsActivity::class.java))
+                true
+            }
+            R.id.action_history -> {
+                startActivity(Intent(this, HistoryActivity::class.java))
+                true
+            }
+            R.id.action_debug -> {
+                showDebugLog()
+                true
+            }
+            R.id.action_settings -> {
+                startActivity(Intent(this, SettingsActivity::class.java))
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
+    }
+
+    override fun onBackPressed() {
+        // 独立界面：只在入口那一页之上还有历史时才后退；退到入口就不再退了，
+        // 直接关掉本界面回到上一层（避免登录回跳等自身重定向把用户困在两层之间）。
+        val idx = webView.copyBackForwardList().currentIndex
+        if (webView.canGoBack() && !isAtScreenEntry(idx)) {
+            webView.goBack()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
+    /**
+     * 当前这一格历史是否为「本界面的入口」——是则返回键不再后退，直接关掉本界面。
+     *
+     * 不能写死 `currentIndex <= 1`：入口页被站点 302 时确实会多占一格
+     * （如 thread-x-x-x.html → forum.php?mod=viewthread&tid=x、登录态失效时先跳登录页），
+     * 但用户在本界面里点开的帖子同样落在下标 1 上 —— 若一并当成入口残留直接关界面，
+     * 就会一步跨过中间的列表，落回上一层（从分区列表点进帖子再返回，退到总分区列表的根因）。
+     *
+     * 规则：
+     *  - 下标 0：永远是入口；
+     *  - 那一格是帖子：只有与入口是同一个帖子（同 tid 的另一种地址形态）才算入口；
+     *  - 那一格不是帖子（列表 / 登录页等）：只有紧邻入口的下标 1 才算入口残留，
+     *    更深处是用户在本界面内点开的另一个列表，必须能退回去。
+     */
+    private fun isAtScreenEntry(idx: Int): Boolean {
+        if (!threadMode) return false
+        if (idx <= 0) return true
+        val itemUrl = try {
+            webView.copyBackForwardList().getItemAtIndex(idx)?.url
+        } catch (e: Exception) {
+            null
+        }
+        if (itemUrl.isNullOrBlank()) return idx == 1
+        if (isThreadUrl(itemUrl)) return isSameThreadPage(itemUrl, entryUrl)
+        return idx == 1
+    }
+
+    /**
+     * 两个地址是否指向「同一个帖子的同一页」。
+     *
+     * 帖子的地址形态不止一种（`thread-{tid}-{page}-{extra}.html` 与
+     * `forum.php?mod=viewthread&tid=x&page=n`），站点做规范化跳转时会在历史里多占一格，
+     * 这种要视为同一页（否则按返回会被困在原地）；而同一帖子的第 1 页与第 2 页不算同一页，
+     * 否则翻页后按返回会直接退出整个界面。
+     */
+    private fun isSameThreadPage(a: String?, b: String?): Boolean {
+        val ta = threadIdOf(a) ?: return false
+        val tb = threadIdOf(b) ?: return false
+        return ta == tb && threadPageOf(a) == threadPageOf(b)
+    }
+
+    /** 从帖子地址里取数字主题 id（tid），取不到返回 null */
+    private fun threadIdOf(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        Regex("[?&]tid=(\\d+)").find(url)?.let { return it.groupValues[1] }
+        Regex("/thread-(\\d+)").find(url)?.let { return it.groupValues[1] }
+        return null
+    }
+
+    /** 从帖子地址里取页码（默认第 1 页）；注意不能误吃 `extra=page%3D1` 这类参数 */
+    private fun threadPageOf(url: String?): Int {
+        if (url.isNullOrBlank()) return 1
+        Regex("[?&]page=(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() ?: 1 }
+        // 伪静态形态 thread-{tid}-{page}-{extra}.html
+        Regex("/thread-\\d+-(\\d+)-").find(url)?.let { return it.groupValues[1].toIntOrNull() ?: 1 }
+        return 1
+    }
+
+    /** 诊断日志弹窗：查看 / 复制 / 清空 */
+    private fun showDebugLog() {
+        val tv = android.widget.TextView(this).apply {
+            text = DebugLog.dump().ifBlank { "（暂无日志，请先去页面点击一次下载按钮再回来看）" }
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(32, 24, 32, 24)
+            setTextIsSelectable(true)
+        }
+        val sv = android.widget.ScrollView(this).apply { addView(tv) }
+        AlertDialog.Builder(this)
+            .setTitle("诊断日志")
+            .setView(sv)
+            .setPositiveButton("关闭", null)
+            .setNegativeButton("复制") { _, _ ->
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("debug_log", DebugLog.dump()))
+                Toast.makeText(this, "已复制，可粘贴发送", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("清空") { _, _ -> DebugLog.clear() }
+            .show()
+    }
+}
