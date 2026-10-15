@@ -46,12 +46,17 @@ object DownloadHelper {
      *        `forum.php?mod=attachment&aid=…`（解析出来是脚本页名），只有帖子里的名字才是用户想要的。
      * @param onHtmlFallback 原生请求最终仍返回网页时回调（主线程），参数为原始下载地址；
      *        传 null 则直接抛错提示
+     * @param onResult 下载结束回调（主线程）：true = 已落盘或已成功转交浏览器通道，
+     *        false = 抛错失败。调用方（MainActivity 的通道去重）据此在**失败时释放去重占位** ——
+     *        否则下载失败（超时/403/写入异常）后 30 秒内的重试会被当成「重复下载」静默丢掉，
+     *        用户表现同样是「点了没反应」。
      */
     fun start(
         ctx: Context, userAgent: String, url: String,
         contentDisposition: String?, referer: String?,
         nameHint: String? = null,
-        onHtmlFallback: ((String) -> Unit)? = null
+        onHtmlFallback: ((String) -> Unit)? = null,
+        onResult: ((Boolean) -> Unit)? = null
     ) {
         val appCtx = ctx.applicationContext
         thread {
@@ -64,10 +69,12 @@ object DownloadHelper {
                         Toast.makeText(appCtx, "下载完成：$finalName\n保存于 Download/${Prefs.getDownloadDir(appCtx)}", Toast.LENGTH_LONG).show()
                     }
                 }
+                if (onResult != null) mainHandler.post { onResult(true) }
             } catch (e: Exception) {
                 mainHandler.post {
                     Toast.makeText(appCtx, "下载失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
+                if (onResult != null) mainHandler.post { onResult(false) }
             }
         }
     }
@@ -95,9 +102,12 @@ object DownloadHelper {
      * 文件名里只要出现站点标记（sxsy.org / soushu2025.com 等）就一律去掉。
      */
     fun resolveFileName(url: String, contentDisposition: String?, nameHint: String? = null): String {
-        // 0. 最高优先级：帖子标题（书名号内）或帖子内附件名
-        if (!nameHint.isNullOrBlank()) {
-            val raw = nameHint.trim()
+        // 0. 最高优先级：帖子标题（书名号内）或帖子内附件名。
+        //    URL / 路径冒充的候选不算数（见 isUsableNameHint）——否则会存成
+        //    `https data_attachment_forum_…_xxx.txt` 这种畸形名。
+        val hint = nameHint?.takeIf { isUsableNameHint(it) }
+        if (hint != null) {
+            val raw = hint.trim()
             val needsRepair = raw.contains('\uFFFD') || looksMojibake(raw)
             var cleaned = (if (needsRepair) fixEncoding(raw) else raw)
                 .replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
@@ -130,13 +140,19 @@ object DownloadHelper {
         }
 
         // 3. URL 最后一段兜底：但 Discuz 附件链接形如 forum.php?mod=attachment&aid=xxx，
-        //    其最后一段是 forum.php —— 脚本页绝不是文件名，必须排除
+        //    其最后一段是 forum.php —— 脚本页绝不是文件名，必须排除。
+        //
+        //    ⚠️ Android 的 `Uri.lastPathSegment` 返回的**已经是解码后的段**
+        //    （`…/%EF%BC%88…%2B%E7%95%AA%E5%A4%96.txt` → `（…全本+番外.txt`），
+        //    所以只有仍残留 '%' 时才再解一次。无条件 URLDecoder.decode 会把名字里的
+        //    正则 `+` 当成空格（实测 `…全本+番外.txt` → `…全本 番外.txt`）。
         if (name.isNullOrBlank() || !name!!.contains('.') || looksLikeScriptOrGenericPage(name)) {
             val seg = Uri_parseLastSegment(url)
             if (seg != null && seg.contains('.') && !looksLikeScriptOrGenericPage(seg)) {
-                val segName = try {
-                    fixEncoding(URLDecoder.decode(seg, "UTF-8"))
-                } catch (e: Exception) { fixEncoding(seg) }
+                val decoded = try {
+                    if (seg.contains('%')) URLDecoder.decode(seg, "UTF-8") else seg
+                } catch (e: Exception) { seg }
+                val segName = maybeRepairEncoding(decoded)
                 if (!looksLikeScriptOrGenericPage(segName)) name = segName
             }
         }
@@ -146,8 +162,12 @@ object DownloadHelper {
             name = "download_" + System.currentTimeMillis()
         }
 
-        var result = fixEncoding(name!!)
-        result = stripWebsite(result)
+        // 同上：名字已经是可读的就不该再跑乱码修复；
+        // 用 stripSiteWatermark 而不是 stripWebsite —— 后者的 trim 列表含 '（' '）' '【' '】'，
+        // 会把书名自带的装饰括号吃掉（实测 `（读书会）你们就放过我这正经摄影师吧…txt`
+        // → `读书会）你们就放过…txt`，**首括号丢失、留下孤儿右括号**）。
+        var result = maybeRepairEncoding(name!!)
+        result = stripSiteWatermark(result)
 
         // 清理文件名非法字符与无效乱码
         result = result.replace(Regex("[\\\\/:*?\"<>|\\uFFFD]"), "_")
@@ -229,6 +249,43 @@ object DownloadHelper {
      * 同时尝试多种还原路径，优先选择中文字符更多且替换符更少的结果。
      */
     fun fixEncoding(s: String): String = decodeFilenameCandidates(s).firstOrNull() ?: s
+
+    /**
+     * 只在**确实坏了**的时候才调用 [fixEncoding]。
+     *
+     * [fixEncoding] 的用途是「输入已经是乱码，穷举编码组合再按 scoreName 打分选最优」。
+     * 拿一个**正常的中文名**去跑它，等于让它参加「GBK↔UTF-8 双向误解码」的穷举竞赛 ——
+     * 评分只看汉字加分、不惩罚英文数字标点，正常名字反而会输给乱码候选。
+     * 实测 `（读书会）你们就放过我这正经摄影师吧⊙式Hikari⊙全本+番外.txt`
+     * 会被解成控制字符 + ASCII 垃圾。
+     *
+     * 这正是「下载下来文件名乱码 / 无法正常重命名」的根因：直链 URL 里本就是可读中文
+     * （DuShuH 的 `txt.53dushu.com/202204/5TXT/（读书会）…全本+番外.txt`），
+     * 却被迫走了一遍乱码修复。
+     */
+    private fun maybeRepairEncoding(s: String): String =
+        if (s.contains('\uFFFD') || looksMojibake(s)) fixEncoding(s) else s
+
+    /**
+     * 判断一个「文件名候选」是否可用作附件名。返回 false 的两类：
+     *  1. 空白；
+     *  2. **其实是 URL / 路径**。
+     *
+     * 页面上的直链下载按钮常把 `title` 设成完整直链
+     * （`https://host/data/attachment/forum/202610/15/220813xxx.txt`），抽取脚本会把它误当文件名上报。
+     * 它**带 `.txt` 后缀**，只判「有没有扩展名」是拦不住的：入库后保存成
+     * `https data_attachment_forum_202610_15_220813xxx.txt`（域名被站点标记规则剥掉、斜杠变下划线）。
+     * 有些论坛（DuShuH）的隐藏区链接文字**本身就是那条 URL**，同样会漏进来。
+     * 正常文件名不含 `:` 与 `/`（Android 上也不允许），据此一律拒收。
+     */
+    fun isUsableNameHint(name: String?): Boolean {
+        val t = name?.trim() ?: return false
+        if (t.isEmpty()) return false
+        if (t.contains("://")) return false
+        if (Regex("^[a-zA-Z][a-zA-Z0-9+.\\-]*:").containsMatchIn(t)) return false
+        if (t.contains('/') || t.contains('\\')) return false
+        return true
+    }
 
     private fun decodeFilenameCandidates(value: String): List<String> {
         val seeds = linkedSetOf(value.trim().trim('"'))
@@ -358,20 +415,25 @@ object DownloadHelper {
     }
 
     /**
-     * 站点水印标记：本项目实际在用的域名。
+     * 站点水印标记：本项目实际在用的域名（**多站适配**，逐个来自真实附件名实测）。
      *
-     * 全部来自真实附件名实测（`sxsy45.com` 抓包）：
-     * `[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt` —— 一个文件名里能同时出现两个标记，
-     * 且第二个还带 `@` 分隔符，所以 `@` 也一并当分隔符清掉。
+     * - `sxsy45.com` 系（尚香书苑）：`[sxsy.org]soushu2025.com@陪读母亲的性事 1-12….txt`
+     *   —— 一个文件名里能同时出现两个标记，且第二个还带 `@` 分隔符，所以 `@` 也一并当分隔符清掉。
+     * - `dushuh.com` / `53dushu.com` 系（读书会 / DuShuH）：文件名常以
+     *   `53dushu.com@书名.txt` 或 `[www.dushuh.com]书名.txt` 形式出现。
      *
      * 与 [stripWebsite] 的区别是「**一律去掉**」：
      *  - [stripWebsite] 只剥**前缀**（或把中间的域名换成空格），且剥完只剩空白时会还原成原名；
      *  - 这里只要在文件名**任何位置**看到这些域名，就一定清掉，不留还原分支。
-     * 没有出现这些标记时**一个字都不改**（避免破坏 `【书名】（加料版）` 这类带装饰括号的原名）。
+     * 没有命中这些标记时**一个字都不改** —— 所以 `（读书会）你们就放过我这正经摄影师吧…txt`
+     * 里的 `（读书会）` 是**书名自带的**，会被原样保留（它不是站点标记，避免破坏
+     * `【书名】（加料版）` 这类带装饰括号的原名）。
      */
     private val SITE_MARKS = listOf(
         "sxsy.org", "www.sxsy.org", "sxsy45.com", "www.sxsy45.com",
-        "soushu2025.com", "www.soushu2025.com"
+        "soushu2025.com", "www.soushu2025.com",
+        "dushuh.com", "www.dushuh.com",
+        "53dushu.com", "www.53dushu.com", "txt.53dushu.com"
     )
 
     /** 文件名里识别到站点标记就一律去掉；没有标记则原样返回。 */

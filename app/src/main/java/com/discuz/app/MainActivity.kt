@@ -365,6 +365,7 @@ override fun onResume() {
                 injectAdBlock()
                 if (DOM_NAME_RENAMING) injectAttachNameJs()   // 屏蔽重命名时不采集附件显示名
                 injectForumCleanup()
+                injectShowhideDownload()   // 隐藏内容区直链：自动加下载按钮
                 injectAutoSign()
                 injectAttachPayHook()
                 tryAutoPay()
@@ -550,6 +551,12 @@ override fun onResume() {
                     } else {
                         val hint = preferredNameFor(p.finalUrl)
                         val name = DownloadHelper.resolveFileName(p.finalUrl, p.disposition, hint)
+                        // 补「开始下载」提示：与 onDownloadStart 通道一致，让「白嫖下载」按钮
+                        // 点击后也有即时反馈（此前只有「下载完成」一条提示，用户会以为没反应）。
+                        val nameDisplay = if (name.startsWith("download_")) "自动识别文件名" else name
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
+                        }
                         val savedName = DownloadHelper.saveFromFile(this@MainActivity, p.file, name, !hint.isNullOrBlank())
                         p.file.delete()
                         noteSaved(url, savedName)
@@ -724,11 +731,34 @@ override fun onResume() {
     /** HTML 探测后放行一次原生导航，防止 shouldInterceptRequest 与 WebView 互相循环 */
     private val bypassProbeUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    /** 去重键：优先用 path（忽略 ?query#frag），拿不到就用原串 */
+    /**
+     * 去重键。
+     *
+     * ⚠️ **附件身份 `aid` 必须进 key**：Discuz 的附件身份在 **query** 里，形如
+     * `/forum.php?mod=attachment&aid=<base64>`。若只按 `scheme://host + path` 做键，
+     * 同一帖里两个附件会**折叠成同一个键** `https://host/forum.php` ——
+     * 于是 30 秒窗口内先下 A 再点 B 时，B 被 `markHandled` 判成「重复下载」**静默 return**
+     * （只写日志、没有任何提示），拦截网那边还会给 B 回一个 204，
+     * 用户表现就是「点第二个附件没反应」。
+     *
+     * aid 优先用**解出来的纯数字**（base64 第一段，跨请求稳定，与 [auditIdOf]/名字表同一套规则）；
+     * 解不出就退回 `?aid=` 参数原文。
+     *
+     * 没有 aid 的地址（直链 `/data/attachment/…/文件名.txt` 等）**仍只按 path 做键**：
+     * 这类地址常带随机查询参数，把 query 算进去反而会让同一个文件判不成重复 → 退回「同一文件下两遍」。
+     */
     private fun urlKey(url: String): String = try {
         val u = android.net.Uri.parse(url)
-        (if (u.scheme != null) u.scheme + "://" + u.host.orEmpty() else "") + (u.path ?: url)
+        val base = (if (u.scheme != null) u.scheme + "://" + u.host.orEmpty() else "") + (u.path ?: url)
+        val id = auditIdOf(url) ?: rawAidOf(url)
+        if (id.isNullOrBlank()) base else "$base|aid=$id"
     } catch (e: Exception) { url }
+
+    /** `?aid=` 原文兜底（base64 解不出纯数字 aid 时，用它保证「不同附件不同键」） */
+    private fun rawAidOf(url: String?): String? = try {
+        if (url.isNullOrBlank()) null
+        else android.net.Uri.parse(url).getQueryParameter("aid")?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) { null }
 
     /** 只判断是否已处理过，**不打标记**（给「吞掉重复请求」用） */
     private fun isHandled(url: String): Boolean {
@@ -1064,18 +1094,45 @@ override fun onResume() {
     return !t || /^(下载|附件|立即下载|点击下载|点击这里下载|重新下载|免费|购买|记录|查看|下载附件|点击文件名下载附件|download|attach|attachment)$/i.test(t);
   }
 
+  // 文件名候选是否其实是 URL / 路径（与 Kotlin 侧 DownloadHelper.isUsableNameHint 同一套判据）。
+  // 两个实测来源都会把 URL 当名字：
+  //   ① 直链下载按钮的 `title` 被上层脚本设成了完整直链（以 .txt 结尾，骗过「带扩展名」判据）；
+  //   ② DuShuH 隐藏区的链接文字**本身就是那条 URL**（`…/（读书会）…全本+番外.txt`）。
+  // 正常文件名不含 `:` 与 `/`，据此一律拒收。
+  function looksUrl(t){
+    if(!t) return true;
+    return /:\/\//.test(t) || /^[a-z][a-z0-9+.\-]*:/i.test(t) ||
+           t.indexOf('/')!==-1 || t.indexOf('\\')!==-1;
+  }
+
+  // 通用直链文件（**多站适配的关键**）：不看域名、不看论坛模板，只看路径是否以
+  // 文档/压缩包扩展名结尾。
+  // DuShuH（53dushu.com）把 TXT 挂在**独立静态域名**上，页面上既没有 aid、
+  // 也没有 /data/attachment/，只有形如
+  //   https://txt.53dushu.com/202204/5TXT/%EF%BC%88…%EF%BC%89…%E7%95%AA%E5%A4%96.txt
+  // 的直链；不认这类链接就取不到名字，下载只能退回 URL 兜底 → 名字被编码处理搞坏。
+  var RE_DIRECT_FILE = /\.(?:txt|zip|rar|7z|epub|pdf|mobi|fb2|docx?|xlsx?|pptx?|apk)(?:[?#].*)?$/i;
+  function isDirectFileHref(href){
+    if(!href) return false;
+    if(!/^https?:\/\//i.test(href) && !/^\/\//.test(href) && href.indexOf('/')<0) return false;
+    return RE_DIRECT_FILE.test(String(href).split('#')[0]);
+  }
+
   // 文件链接判定：
   //   mod=attachment / attachment.php        —— 带 aid 的标准/付费附件
-  //   /data/attachment/...                   —— **直链附件**（本站实际大量使用，形如
+  //   /data/attachment/...                   —— **直链附件**（sxsy45 大量使用，形如
   //     https://sxsy45.com/data/attachment/forum/202610/09/221630f66g16b3rgcc3g65.txt）
-  //     这种链接 URL 里没有 aid、末段只是哈希，名字**只能**从同一组 DOM 里取，
+  //   通用扩展名直链                          —— 其它论坛（DuShuH 的 txt.53dushu.com、
+  //     读书会等）把文件挂在独立域名/静态目录上，只能靠扩展名识别
+  //     这种链接 URL 里没有 aid、末段才是真名，名字**只能**从同一组 DOM 里取，
   //     所以要单独上报并以「完整 URL」为键（原生侧下载用的就是这个 URL，能直接对上）。
   // 排除 action=viewattachpayments（那是「记录」页，不是文件）
   function isFileLink(href){
     if(!href) return false;
     if(/viewattachpayments/i.test(href)) return false;
     return /mod=attachment/i.test(href) || /attachment\.php/i.test(href) ||
-           /action=attachpay/i.test(href) || /\/data\/attachment\//i.test(href);
+           /action=attachpay/i.test(href) || /\/data\/attachment\//i.test(href) ||
+           isDirectFileHref(href);
   }
 
   // 从 href 求 Discuz 附件 id（纯数字 aid，或 base64 解码后取第一段）
@@ -1129,18 +1186,18 @@ override fun onResume() {
         // ① 标准模板：<span class="attachname">真实文件名</span>
         var sp=box.querySelector('.attachname');
         var t=norm(sp? sp.textContent : '');
-        if(!isGeneric(t)) return t;
+        if(!isGeneric(t) && !looksUrl(t)) return t;
         // ② 尚香书苑形态：<p class="attnm"><a>真实文件名</a></p> —— 文件名就是链接文字
         var pn=box.querySelector('p.attnm a');
         if(pn){
           var t2=norm(pn.textContent);
-          if(!isGeneric(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
+          if(!isGeneric(t2) && !looksUrl(t2) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(t2)) return t2;
         }
         // 兜底：容器 dd / .mbn / .attnm 内首个「像文件名」的文本（含扩展名）
         var cands=box.querySelectorAll('dd,p,.mbn,.attnm');
         for(var i=0;i<cands.length;i++){
           var x=norm(cands[i].textContent);
-          if(!isGeneric(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
+          if(!isGeneric(x) && !looksUrl(x) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(x)) return x;
         }
         // 再兜底 ①：容器里的**叶子元素**（没有元素子节点）文本，以扩展名结尾者即文件名。
         // 走叶子是为了**保留中文文件名里的空格**，例如「痴母素素 作者：qwert79268.txt」
@@ -1150,7 +1207,7 @@ override fun onResume() {
           var e=leaves[j];
           if(e.children && e.children.length>0) continue;
           var t3=norm(e.textContent);
-          if(!isGeneric(t3) && t3.length<=120 && /\.[A-Za-z0-9]{1,6}$/.test(t3)) return t3;
+          if(!isGeneric(t3) && !looksUrl(t3) && t3.length<=120 && /\.[A-Za-z0-9]{1,6}$/.test(t3)) return t3;
         }
         // 再兜底 ②：文件名可能是**裸文本节点**（和「下载」链接并列），
         // 这种只能把容器文本按空白/标点切词，找第一个以扩展名结尾的词。
@@ -1159,17 +1216,19 @@ override fun onResume() {
           var parts=whole.split(/[\s,，;；|]+/);
           for(var k2=0;k2<parts.length;k2++){
             var tok=parts[k2].replace(/^[<("'《【\[]+/,'').replace(/[>)"'》】\],，。]+$/,'');
-            if(!isGeneric(tok) && tok.length<=100 && /\.[A-Za-z0-9]{1,6}$/.test(tok)) return tok;
+            if(!isGeneric(tok) && !looksUrl(tok) && tok.length<=100 && /\.[A-Za-z0-9]{1,6}$/.test(tok)) return tok;
           }
         }
       }
       // 最后兜底：链接自身文字 / title（部分模板直接把文件名写成链接文字）
       // ⚠ 必须**带扩展名**才算文件名：本站直链附件的按钮文字是「白嫖下载」，
       //   没有扩展名，早期版本会把它当成文件名存下来。
+      // ⚠⚠ 还必须**不是 URL/路径**：DuShuH 隐藏区的链接文字就是那条直链 URL，
+      //   它以 .txt 结尾，只判扩展名会把它当文件名（见 looksUrl 注释）。
       var at=norm(a.textContent);
-      if(!isGeneric(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
+      if(!isGeneric(at) && !looksUrl(at) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(at)) return at;
       var ti=norm(a.getAttribute && a.getAttribute('title'));
-      if(!isGeneric(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
+      if(!isGeneric(ti) && !looksUrl(ti) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(ti)) return ti;
       return '';
     }catch(e){ return ''; }
   }
@@ -1185,7 +1244,7 @@ override fun onResume() {
                 'data-origin-name','data-src-name','download','data-attname'];
       for(var i=0;i<keys.length;i++){
         var v=norm(a.getAttribute && a.getAttribute(keys[i]));
-        if(!isGeneric(v) && v.length<=160 && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(v)) return v;
+        if(!isGeneric(v) && !looksUrl(v) && v.length<=160 && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(v)) return v;
       }
       // jQuery data 缓存：$(a).data('filename')
       try{
@@ -1194,7 +1253,7 @@ override fun onResume() {
           for(var k in d){
             if(!Object.prototype.hasOwnProperty.call(d,k)) continue;
             var dv=norm(d[k]);
-            if(typeof dv==='string' && !isGeneric(dv) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(dv)) return dv;
+            if(typeof dv==='string' && !isGeneric(dv) && !looksUrl(dv) && /\.[A-Za-z0-9]{1,6}(\s|,|$)/.test(dv)) return dv;
           }
         }
       }catch(e2){}
@@ -1226,9 +1285,32 @@ override fun onResume() {
         var e=leaves[i];
         if(e.children && e.children.length>0) continue;
         var t=norm(e.textContent);
-        if(!isGeneric(t) && t.length<=160 && /\.[A-Za-z0-9]{1,6}$/.test(t)) return t;
+        if(!isGeneric(t) && !looksUrl(t) && t.length<=160 && /\.[A-Za-z0-9]{1,6}$/.test(t)) return t;
       }
       return '';
+    }catch(e){ return ''; }
+  }
+
+  /**
+   * 从链接地址取文件名（**多站适配兜底**）：取路径最后一段，只有还残留 `%` 时才解码。
+   *
+   * ⚠ 不要无条件做 URLDecoder / `+→空格` 处理：`%2B` 解出来就是真正的 `+`
+   *   （DuShuH 的 `…%E5%85%A8%E6%9C%AC%2B%E7%95%AA%E5%A4%96.txt` → `…全本+番外.txt`），
+   *   而 URL 路径里未编码的 `+` 也是字面 `+`。用 decodeURIComponent 语义即可，别把 `+` 变空格。
+   */
+  function nameFromHref(href){
+    try{
+      var u=String(href||'').split('#')[0].split('?')[0];
+      var seg=u.substring(u.lastIndexOf('/')+1);
+      if(!seg) return '';
+      var dec=seg;
+      try{ if(seg.indexOf('%')>=0) dec=decodeURIComponent(seg); }catch(e){ dec=seg; }
+      dec=norm(dec);
+      if(!dec || isGeneric(dec) || looksUrl(dec)) return '';
+      if(!/\.[A-Za-z0-9]{1,8}$/.test(dec)) return '';
+      // 排除脚本页/网页扩展名：`forum.php`、`attachment.php` 这类端点绝不是文件名
+      if(/\.(php\d?|phtml|phps|asp|aspx|ashx|jsp|jspx|do|action|cgi|pl|shtml|html?|xhtml)$/i.test(dec)) return '';
+      return dec;
     }catch(e){ return ''; }
   }
 
@@ -1236,25 +1318,34 @@ override fun onResume() {
     try{
       if(!window.DiscuzApp || !window.DiscuzApp.attachName) return;
       var links=document.querySelectorAll(
-        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"],a[href*="/data/attachment/"]');
+        'a[href*="mod=attachment"],a[href*="attachment.php"],a[href*="action=attachpay"],a[href*="/data/attachment/"],'+
+        'a[href*=".txt"],a[href*=".zip"],a[href*=".rar"],a[href*=".7z"],a[href*=".epub"],a[href*=".pdf"],a[href*=".mobi"]');
       var rows=0;
       for(var i=0;i<links.length;i++){
         var a=links[i], href=a.getAttribute('href')||'';
         if(!isFileLink(href)) continue;
+        // ★ 先去重、再取名：nameOf/nameFromAttrs/nameFromWideContainer 都要上溯 DOM 并在容器里
+        //   querySelectorAll，是这个循环里最贵的一步；对**每个**链接每轮都跑一遍没必要。
+        var id0=auditOf(href);
+        var key0=id0||(a.href||href);
+        if(reported[key0]) continue;
         var nm=nameOf(a);
         // 第三方脚本注入的直链：先看属性里有没有藏文件名，再放宽到整块帖子容器里找
         if(!nm) nm=nameFromAttrs(a);
         if(!nm) nm=nameFromWideContainer(a);
+        // 都取不到时，用 URL 末段解码兜底（多站适配：DuShuH 这类「链接文字就是 URL」
+        // 的站点，末段就是真名；原生侧 resolveFileName 也会做同一件事，这里先报上去
+        // 能让命名走「DOM 提示」这条干净路径，避免再被编码修复误伤）。
+        // 只对**真正的直链文件**这么做 —— `mod=attachment&aid=…` 那种端点的末段是
+        // `forum.php` 之类的脚本名，不能当文件名。
+        if(!nm && isDirectFileHref(href)) nm=nameFromHref(href);
         if(!nm) continue;
-        var id=auditOf(href);
-        if(id){
-          if(reported[id]) continue;
-          reported[id]=1;
-          try{ window.DiscuzApp.attachName(id, nm); }catch(e){}
+        if(id0){
+          reported[id0]=1;
+          try{ window.DiscuzApp.attachName(id0, nm); }catch(e){}
         }else{
           // 直链附件没有 aid → 用**绝对 URL** 做键上报；原生侧下载用的就是这个 URL，能直接对上
           var key=a.href||href;
-          if(reported[key]) continue;
           reported[key]=1;
           try{ window.DiscuzApp.attachNameByUrl(key, nm); }catch(e){}
         }
@@ -1325,6 +1416,115 @@ override fun onResume() {
         val js = AdBlocker.cleanupJs()
         webView.evaluateJavascript(js, null)
         DebugLog.log("AD", "已注入清理脚本（外链分区按官方文案识别）")
+    }
+
+    /**
+     * 「隐藏内容」区直链下载按钮。
+     *
+     * Discuz 帖子里的「本帖隐藏的内容」用 `<div class="showhide">` 呈现，其中可能直接放
+     * 一个免费直链（如 `https://txt.53dushu.com/.../xxx.txt`），点击即在线打开 / 浏览器下载。
+     * 这里在页面加载完成后扫描所有 `.showhide`，把其中指向常见文档压缩包的直链
+     * 就地加一个「⬇ 下载」按钮，点按钮走原生下载器（带 Cookie/UA/Referer、流式落盘）。
+     *
+     * 边界（重要，也是「不影响其他论坛」的关键）：
+     *  - 只认 `.showhide` 容器 + 直链扩展名（txt/zip/rar/7z/epub/pdf 等），**不写死任何站点域名**，
+     *    所以任意 Discuz X3.x 论坛通用，对其他论坛是增强而非干扰；
+     *  - **绝不自动回帖 / 自动回复解锁**。本脚本只读取页面已经展示出来的直链，
+     *    隐藏内容若尚未解锁（需要回帖才显示），这里看不到链接、也就不会做任何动作。
+     */
+    private fun injectShowhideDownload() {
+        val js = """
+(function(){
+  if(window.__dzShowhideDl) return; window.__dzShowhideDl=1;
+  // 纯文本直链：http(s)://…结尾是文档/压缩包扩展名（隐藏区常见的「裸链接，不可点」）
+  var RE_URL = /https?:\/\/[^\s"'<>()\[\]]+?\.(?:txt|zip|rar|7z|epub|pdf|docx?|xlsx?|pptx?|apk)(?:\?[^\s"'<>]*)?/ig;
+
+  function nameFromUrl(h){
+    try{
+      var u = h.split('?')[0];
+      var seg = u.substring(u.lastIndexOf('/')+1);
+      return decodeURIComponent(seg);
+    }catch(e){ return ''; }
+  }
+  function buildBtn(h, name){
+    var btn = document.createElement('a');
+    btn.className = 'dz-dlbtn';
+    btn.textContent = '⬇ 下载 ' + (name||'文件');
+    btn.style.cssText = 'display:inline-block;margin:6px 6px 0 0;padding:6px 14px;'+
+      'background:#1e9fff;color:#fff;text-decoration:none;border-radius:4px;'+
+      'font-size:13px;line-height:1.4;';
+    btn.setAttribute('data-dz-url', h);
+    btn.setAttribute('data-dz-name', name||'');
+    btn.onclick = function(e){
+      e.preventDefault(); e.stopPropagation();
+      var u = this.getAttribute('data-dz-url')||'';
+      var n = this.getAttribute('data-dz-name')||'';
+      try{
+        if(window.DiscuzApp && window.DiscuzApp.showhideDownload){
+          window.DiscuzApp.showhideDownload(u, n);
+        } else { window.location.href = u; }
+      }catch(err){ window.location.href = u; }
+      return false;
+    };
+    return btn;
+  }
+  function addButtons(){
+    // **多站适配**：隐藏内容容器的 class 各站不一 —— Discuz 默认 `.showhide`（DuShuH 就是），
+    // 其它站常见 `.locked` / `.hidecontent` / `.hide-content`，还有把 showhide 拼进复合类名的。
+    // 这里一并收进来；命中的框会打 `data-dzshowhide` 防重复，框内已在 `<a>` 里的文字一律跳过。
+    var boxes = document.querySelectorAll('.showhide,[class*="showhide"],.locked,.hidecontent,.hide-content');
+    for(var i=0;i<boxes.length;i++){
+      var box = boxes[i];
+      if(box.getAttribute('data-dzshowhide')) continue;
+      var added = 0;
+
+      // 只处理「纯文本」里的直链：回复框内没有任何可点击元素、只有一段文字 URL。
+      // 已经是 <a> 链接的（附件 / 已可点直链）一律跳过，交给既有脚本，绝不重复。
+      var walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT, null, false);
+      var textNodes = [];
+      var tn;
+      while((tn = walker.nextNode())){ textNodes.push(tn); }
+      for(var k=0;k<textNodes.length;k++){
+        var node = textNodes[k];
+        var txt = node.nodeValue||'';
+        if(txt.indexOf('.')<0) continue;
+        if(!/https?:\/\//i.test(txt)) continue;
+        // 跳过那些已经位于 <a> 内的文本（本来就是可点击的链接文字）
+        var pa = node.parentNode;
+        if(pa && pa.closest && pa.closest('a[href]')) continue;
+        var replaced = false;
+        var doc = document.createElement('span');
+        var last = 0;
+        RE_URL.lastIndex = 0;
+        var m;
+        while((m = RE_URL.exec(txt)) !== null){
+          if(m.index > last){ doc.appendChild(document.createTextNode(txt.slice(last, m.index))); }
+          var u = m[0];
+          var nm = nameFromUrl(u);
+          var linkA = document.createElement('a');
+          linkA.href = u; linkA.textContent = u; linkA.style.color = '#08c'; linkA.style.wordBreak='break-all';
+          doc.appendChild(linkA);
+          doc.appendChild(buildBtn(u, nm));
+          last = m.index + m[0].length;
+          replaced = true;
+        }
+        if(last < txt.length){ doc.appendChild(document.createTextNode(txt.slice(last))); }
+        if(replaced && node.parentNode){
+          node.parentNode.replaceChild(doc, node);
+          added++;
+        }
+      }
+
+      if(added>0){ box.setAttribute('data-dzshowhide','1'); }
+    }
+  }
+  // 文档已完整（onPageFinished 注入），但隐藏区可能被站点脚本稍后填充，兜底再扫一轮
+  addButtons();
+  setTimeout(addButtons, 1200);
+})();
+""".trimIndent()
+        webView.evaluateJavascript(js, null)
+        DebugLog.log("SHOWHIDE", "已注入隐藏内容直链下载按钮脚本")
     }
 
     /**
@@ -1793,6 +1993,34 @@ override fun onResume() {
             runOnUiThread { onDownloadStart(url, null, null) }
         }
 
+        /**
+         * 「隐藏内容」区直链下载（由 [injectShowhideDownload] 注入的按钮触发）。
+         *
+         * 与 [directDownload] 的差异：附件走的是论坛域名白名单（[isTrustedJsUrl]），
+         * 而隐藏内容里的直链常挂在独立静态域名（如 txt.53dushu.com）上，不属于论坛子域，
+         * 会被白名单拦掉。这里单开一个**受控通道**——不套论坛域名白名单，改为
+         * 严格校验「必须是文档/压缩包直链扩展名」，且只接受我们自己注入的按钮上报，
+         * 用户明确点击才触发，风险可控、也不削弱原有附件下载的安全设计。
+         */
+        @JavascriptInterface
+        fun showhideDownload(url: String?, name: String?) {
+            if (url.isNullOrBlank()) return
+            val httpUrl = if (url.startsWith("http://") || url.startsWith("https://")) {
+                url
+            } else {
+                try {
+                    java.net.URL(java.net.URL(webView.url ?: return), url).toString()
+                } catch (e: Exception) { return }
+            }
+            if (!isShowhideDirectUrl(httpUrl)) {
+                DebugLog.log("SEC", "拒绝隐藏区非直链下载: $httpUrl")
+                return
+            }
+            directNameHint = name?.trim()
+                ?.takeIf { it.isNotEmpty() && it.length <= 160 && DownloadHelper.isUsableNameHint(it) }
+            runOnUiThread { onDownloadStart(httpUrl, null, null) }
+        }
+
         /** 注入脚本扫完一轮附件名后的回调：用于等名字就绪再触发购买后的自动下载 */
         @JavascriptInterface
         fun attachNamesReady(count: Int, candidates: Int) {
@@ -1834,6 +2062,11 @@ override fun onResume() {
             if (auditId.isNullOrBlank() || name.isNullOrBlank()) return
             val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
             if (clean.isEmpty() || clean.length > 120) return
+            // 拒收「其实是 URL / 路径」的候选（详见 DownloadHelper.isUsableNameHint）。
+            if (!DownloadHelper.isUsableNameHint(clean)) {
+                DebugLog.log("ATT", "忽略疑似 URL 的附件名: $auditId -> $clean")
+                return
+            }
             attachNames[auditId.trim()] = clean
             DebugLog.log("ATT", "附件名上报: $auditId -> $clean")
         }
@@ -1841,12 +2074,18 @@ override fun onResume() {
         /**
          * **直链附件**的原始文件名上报（键是完整 URL）。
          * 直链没有 aid，只能以 URL 为键；原生侧下载用的就是同一个 URL，所以一定对得上。
+         * 多站适配后这里也会收到**独立静态域名**上的直链（如 `txt.53dushu.com/.../书名.txt`）。
          */
         @JavascriptInterface
         fun attachNameByUrl(url: String?, name: String?) {
             if (url.isNullOrBlank() || name.isNullOrBlank()) return
             val clean = name.trim().replace(Regex("[\\r\\n\\t]"), " ")
             if (clean.isEmpty() || clean.length > 160) return
+            // 同 attachName：URL 冒充文件名一律不入库（name == url 也是这种误报的典型形态）
+            if (!DownloadHelper.isUsableNameHint(clean) || clean.equals(url.trim(), ignoreCase = true)) {
+                DebugLog.log("ATT", "忽略疑似 URL 的直链附件名: ${url.trim().takeLast(40)} -> $clean")
+                return
+            }
             attachNamesByUrl[url.trim()] = clean
             DebugLog.log("ATT", "直链附件名上报: ${url.trim().takeLast(40)} -> $clean")
         }
@@ -2218,11 +2457,8 @@ override fun onResume() {
             webView.loadUrl(it)
             return
         }
-        // 外部站点（弹窗/新窗口里打开的非论坛域名）一律拦截，不放回主 WebView
-        if (isExternalNavUrl(url)) {
-            DebugLog.log("NAV", "拦截外部站点(弹窗): $url")
-            return
-        }
+        // 外部站点（弹窗/新窗口里打开的普通链接）：放行回主 WebView 在软件内打开，
+        // 不再拦截（与 interceptExternalNav 保持一致）。外链推广分区与广告已在上方拦截。
         DebugLog.log("POPUP", "转发普通页面到主 WebView: $url")
         webView.loadUrl(url)
     }
@@ -2255,6 +2491,9 @@ override fun onResume() {
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
         ) {
+            // 这里已经 markHandled 占过位了，但本次并没有真的发起下载 —— 必须把占位撤掉，
+            // 否则用户授完权重新点击时，30 秒窗口内会被判成「重复下载」静默丢掉。
+            clearHandled(httpUrl)
             requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_STORAGE)
             Toast.makeText(this, "请授予存储权限后重新点击下载", Toast.LENGTH_LONG).show()
             return
@@ -2263,7 +2502,7 @@ override fun onResume() {
         //  1) directNameHint —— tryAutoDownloadAfterBuy 的 JS 在定位到这个附件时算好的名字；
         //  2) directAid → attachNames[aid] —— 同一次调用的附件 id，名字表兜底；
         //  3) preferredNameFor(url) —— 从下载 URL 的 aid 反查名字表，再退回帖子标题规则。
-        val jsHint = directNameHint?.takeIf { it.isNotBlank() }
+        val jsHint = directNameHint?.takeIf { DownloadHelper.isUsableNameHint(it) }
         val jsAid = directAid?.takeIf { it.isNotBlank() }
         directNameHint = null
         directAid = null
@@ -2282,20 +2521,22 @@ override fun onResume() {
         Toast.makeText(this, "开始下载：$nameDisplay", Toast.LENGTH_SHORT).show()
         DownloadHelper.start(
             this, webView.settings.userAgentString, httpUrl,
-            contentDisposition, webView.url, hint
-        ) { origUrl ->
-            runBrowserFetch(origUrl)
-        }
+            contentDisposition, webView.url, hint,
+            onHtmlFallback = { origUrl -> runBrowserFetch(origUrl) },
+            // 下载失败要释放去重占位：否则超时/403/写入异常后，用户在 30 秒窗口内重试
+            // 会被 `markHandled` 当成「重复下载」静默丢掉（只写日志、无提示）。
+            onResult = { ok -> if (!ok) clearHandled(httpUrl) }
+        )
     }
 
-    /** UA 由设置页开关决定，默认电脑版 */
+    /** UA 由设置页开关决定，默认电脑版（桌面 Chrome） */
     private fun buildUserAgent(): String {
         return if (Prefs.isDesktopMode(this)) {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
         } else {
             "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                "(KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
         }
     }
 
@@ -2312,29 +2553,34 @@ override fun onResume() {
      *  绝对 URL 仅当 host 属于可信论坛域名时放行，拦截恶意页面诱导下载/扣费 */
     private fun isTrustedJsUrl(url: String): Boolean {
         if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+        // **多站适配**：直链文件（文档/压缩包扩展名）常挂在论坛以外的独立静态域名上
+        // （DuShuH 的 txt.53dushu.com、读书会的静态目录等）。这类地址的用途只有「下载一个文件」，
+        // 且只可能由用户主动点击触发，放行不削弱原有的论坛域名白名单设计。
+        if (isShowhideDirectUrl(url)) return true
         val host = try { Uri.parse(url).host?.lowercase()?.trim() } catch (e: Exception) { null }
             ?: return false
         return trustedHosts().any { host == it || host.endsWith(".$it") }
     }
 
-    /** URL 是否为「非论坛域名」的外部链接（可能带子域/同域） */
-    private fun isExternalNavUrl(url: String): Boolean {
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return false
-        val hosts = trustedHosts()
-        if (hosts.isEmpty()) return false   // 未配置可信域（理论上不会走到）则放行
-        val h = try { Uri.parse(url).host?.lowercase()?.trim() } catch (e: Exception) { null }
-            ?: return false
-        return hosts.none { trusted ->
-            h == trusted || h.endsWith(".$trusted")
-        }
+    /** 「隐藏内容」区直链的扩展名校验：只放行常见文档/压缩包直链，
+     *  排除脚本页（forum.php 附件交互、viewthread 等），避免按钮被利用去触发任意 URL */
+    private fun isShowhideDirectUrl(url: String): Boolean {
+        val path = try { Uri.parse(url).path?.lowercase() ?: return false } catch (e: Exception) { return false }
+        if (path.isBlank()) return false
+        // 只认明确以文档/压缩包扩展名结尾的路径（去掉查询串后）
+        val clean = path.substringBefore('?').trimEnd('/')
+        if (!Regex("\\.(txt|zip|rar|7z|epub|pdf|docx?|xlsx?|pptx?|apk)$", RegexOption.IGNORE_CASE)
+                .containsMatchIn(clean)) return false
+        return true
     }
 
-    /** 拦截外部站点导航：命中则提示并 return true（不在 WebView / 系统浏览器打开） */
+    /** 外部站点导航：不再拦截，放行给 WebView 在软件内打开。
+     *  回复/帖子内容里的外链（如 txt 在线阅读地址、网盘链接）应能在应用内直接访问，
+     *  而不是被一刀切拦死。安全边界仍由更精准的两道闸守住：
+     *   - 外链推广分区（redirect 型）由 [interceptHiddenForum] 在更早处拦截；
+     *   - 广告资源由 AdBlocker 在资源层拦截。 */
     private fun interceptExternalNav(url: String): Boolean {
-        if (!isExternalNavUrl(url)) return false
-        DebugLog.log("NAV", "拦截外部站点: $url")
-        Toast.makeText(this, "已拦截外部链接", Toast.LENGTH_SHORT).show()
-        return true
+        return false
     }
 
     /**
